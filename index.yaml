@@ -1,0 +1,89 @@
+apiVersion: v1
+entries:
+  vector:
+  - apiVersion: v2
+    appVersion: 0.11.1
+    created: "2021-01-13T11:45:28.480583593Z"
+    dependencies:
+    - name: vector-agent
+      repository: file://../vector-agent
+      version: '*'
+    - name: vector-aggregator
+      repository: file://../vector-aggregator
+      version: '*'
+    description: A Helm chart for Vector observability stack
+    digest: e74bcf5f25b2870de24fc810c3e36d617c64989e9c6a4661eb3618c733efc88e
+    home: https://vector.dev/
+    icon: https://vector.dev/press/vector-icon.svg
+    maintainers:
+    - email: vector@timber.io
+      name: Vector Contributors
+    name: vector
+    sources:
+    - https://github.com/timberio/vector/
+    type: application
+    urls:
+    - https://neticdk.github.io/vector/vector-0.11.1.tgz
+    version: 0.11.1
+  vector-agent:
+  - apiVersion: v2
+    appVersion: 0.11.1
+    created: "2021-01-13T11:45:28.481878006Z"
+    dependencies:
+    - name: vector-shared
+      repository: file://../vector-shared
+      version: '*'
+    description: A Helm chart to collect Kubernetes logs with Vector
+    digest: a93310cb1f1fbb2b8998afd78dca9e6558ed0d2a77a5f545dcb630346d2d710e
+    home: https://vector.dev/
+    icon: https://vector.dev/press/vector-icon.svg
+    maintainers:
+    - email: vector@timber.io
+      name: Vector Contributors
+    name: vector-agent
+    sources:
+    - https://github.com/timberio/vector/
+    type: application
+    urls:
+    - https://neticdk.github.io/vector/vector-agent-0.11.1.tgz
+    version: 0.11.1
+  vector-aggregator:
+  - apiVersion: v2
+    appVersion: 0.11.1
+    created: "2021-01-13T11:45:28.483128818Z"
+    dependencies:
+    - name: vector-shared
+      repository: file://../vector-shared
+      version: '*'
+    description: A Helm chart to aggregate data with Vector
+    digest: f7e9066a1a4b65634b9c295af12d17a0df4f01b503a8ff3dd49e4aeef0c22bae
+    home: https://vector.dev/
+    icon: https://vector.dev/press/vector-icon.svg
+    maintainers:
+    - email: vector@timber.io
+      name: Vector Contributors
+    name: vector-aggregator
+    sources:
+    - https://github.com/timberio/vector/
+    type: application
+    urls:
+    - https://neticdk.github.io/vector/vector-aggregator-0.11.1.tgz
+    version: 0.11.1
+  vector-shared:
+  - apiVersion: v2
+    created: "2021-01-13T11:45:28.483431721Z"
+    description: Shared dependencies of Vector Helm charts
+    digest: 4cddb0e6015d90280f05c05b27adc885d4814579ed92eb2fa525554733ff7785
+    home: https://vector.dev/
+    icon: https://vector.dev/press/vector-icon.svg
+    maintainers:
+    - email: vector@timber.io
+      name: Vector Contributors
+    name: vector-shared
+    sources:
+    - https://github.com/timberio/vector/
+    type: library
+    urls:
+    - https://neticdk.github.io/vector/vector-shared-0.1.0.tgz
+    version: 0.1.0
+generated: "2021-01-13T11:45:28.473981227Z"
