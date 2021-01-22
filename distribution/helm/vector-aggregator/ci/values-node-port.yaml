@@ -1,0 +1,11 @@
+---
+image:
+  version: nightly
+service:
+  type: NodePort
+  ports:
+    - name: xyz
+      port: 1234
+      protocol: TCP
+      nodePort: 4321
+      targetPort: 6543

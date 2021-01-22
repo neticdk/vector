@@ -1,0 +1,5 @@
+---
+image:
+  version: nightly
+vectorSource:
+  enabled: false
