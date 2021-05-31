@@ -18,26 +18,24 @@ installation: _interfaces: "docker-cli": {
 
 	platform_name: "docker"
 
-	roles: [Name=string]: {
-		_api_port:         8383
-		_config_path:      paths.config
+	role_implementations: [Name=string]: {
+		_api_port:         8686
 		_docker_sock_path: "/var/run/docker.sock"
 		commands: {
-			_config_path: paths.config
-			install:      null
-			logs:         "docker logs -f $(docker ps -aqf \"name=vector\")"
-			reload:       "docker kill --signal=HUP timberio/vector"
-			restart:      "docker restart -f $(docker ps -aqf \"name=vector\")"
-			start:        #"""
+			install:   null
+			logs:      "docker logs -f $(docker ps -aqf \"name=vector\")"
+			reload:    "docker kill --signal=HUP timberio/vector"
+			restart:   "docker restart -f $(docker ps -aqf \"name=vector\")"
+			start:     #"""
 								docker run \
 								  -d \
 								  -v \#(paths.config):/etc/vector/vector.toml:ro \
 								  -p \#(_api_port):\#(_api_port) \{flags}
 								  timberio/vector:{version}-{variant}
 								"""#
-			stop:         "docker stop timberio/vector"
-			uninstall:    "docker rm timberio/vector timberio/vector"
-			upgrade:      null
+			stop:      "docker stop timberio/vector"
+			uninstall: "docker rm timberio/vector timberio/vector"
+			upgrade:   null
 		}
 		tutorials: {
 			installation: [
@@ -73,7 +71,7 @@ installation: _interfaces: "docker-cli": {
 		}
 	}
 
-	roles: {
+	role_implementations: {
 		agent: {
 			title:       "Agent"
 			description: #"""
@@ -90,7 +88,7 @@ installation: _interfaces: "docker-cli": {
 
 			variables: config: sources: logs: type: "docker_logs"
 		}
-		sidecar:    roles._file_sidecar
-		aggregator: roles._vector_aggregator
+		sidecar:    role_implementations._file_sidecar
+		aggregator: role_implementations._vector_aggregator
 	}
 }

@@ -1,14 +1,54 @@
-use super::{Config, DataType, Resource};
+use super::{builder::ConfigBuilder, DataType, Resource};
 use std::collections::HashMap;
 
-pub fn check_shape(config: &Config) -> Result<(), Vec<String>> {
+/// Check that provide + topology config aren't present in the same builder, which is an error.
+pub fn check_provider(config: &ConfigBuilder) -> Result<(), Vec<String>> {
+    if config.provider.is_some()
+        && (!config.sources.is_empty() || !config.transforms.is_empty() || !config.sinks.is_empty())
+    {
+        Err(vec![
+            "No sources/transforms/sinks are allowed if provider config is present.".to_owned(),
+        ])
+    } else {
+        Ok(())
+    }
+}
+
+pub fn check_shape(config: &ConfigBuilder) -> Result<(), Vec<String>> {
     let mut errors = vec![];
 
     if config.sources.is_empty() {
         errors.push("No sources defined in the config.".to_owned());
     }
+
     if config.sinks.is_empty() {
         errors.push("No sinks defined in the config.".to_owned());
+    }
+
+    // Helper for below
+    fn tagged<'a>(
+        tag: &'static str,
+        iter: impl Iterator<Item = &'a String>,
+    ) -> impl Iterator<Item = (&'static str, &'a String)> {
+        iter.map(move |x| (tag, x))
+    }
+
+    // Check for non-unique names across sources, sinks, and transforms
+    let mut name_uses = HashMap::<&str, Vec<&'static str>>::new();
+    for (ctype, name) in tagged("source", config.sources.keys())
+        .chain(tagged("transform", config.transforms.keys()))
+        .chain(tagged("sink", config.sinks.keys()))
+    {
+        let uses = name_uses.entry(name).or_default();
+        uses.push(ctype);
+    }
+
+    for (name, uses) in name_uses.into_iter().filter(|(_name, uses)| uses.len() > 1) {
+        errors.push(format!(
+            "More than one component with name \"{}\" ({}).",
+            name,
+            uses.join(", ")
+        ));
     }
 
     // Warnings and errors
@@ -46,11 +86,11 @@ pub fn check_shape(config: &Config) -> Result<(), Vec<String>> {
     }
 }
 
-pub fn check_resources(config: &Config) -> Result<(), Vec<String>> {
+pub fn check_resources(config: &ConfigBuilder) -> Result<(), Vec<String>> {
     let source_resources = config
         .sources
         .iter()
-        .map(|(name, config)| (name, config.resources()));
+        .map(|(name, config)| (name, config.inner.resources()));
     let sink_resources = config
         .sinks
         .iter()
@@ -73,7 +113,7 @@ pub fn check_resources(config: &Config) -> Result<(), Vec<String>> {
     }
 }
 
-pub fn warnings(config: &Config) -> Vec<String> {
+pub fn warnings(config: &ConfigBuilder) -> Vec<String> {
     let mut warnings = vec![];
 
     let source_names = config.sources.keys().map(|name| ("source", name.clone()));
@@ -102,7 +142,7 @@ pub fn warnings(config: &Config) -> Vec<String> {
     warnings
 }
 
-pub fn typecheck(config: &Config) -> Result<(), Vec<String>> {
+pub fn typecheck(config: &ConfigBuilder) -> Result<(), Vec<String>> {
     Graph::from(config).typecheck()
 }
 
@@ -223,13 +263,13 @@ impl Graph {
     }
 }
 
-impl From<&Config> for Graph {
-    fn from(config: &Config) -> Self {
+impl From<&ConfigBuilder> for Graph {
+    fn from(config: &ConfigBuilder) -> Self {
         let mut graph = Graph::default();
 
         // TODO: validate that node names are unique across sources/transforms/sinks?
         for (name, config) in config.sources.iter() {
-            graph.add_source(name, config.output_type());
+            graph.add_source(name, config.inner.output_type());
         }
 
         for (name, config) in config.transforms.iter() {

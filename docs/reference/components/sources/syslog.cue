@@ -25,9 +25,11 @@ components: sources: syslog: {
 					ssl: "optional"
 				}
 			}
-
+			receive_buffer_bytes: {
+				enabled:       true
+				relevant_when: "mode = `tcp` or mode = `udp`"
+			}
 			keepalive: enabled: true
-
 			tls: sources.socket.features.receive.tls
 		}
 	}
@@ -56,6 +58,7 @@ components: sources: syslog: {
 				required:    true
 				type: string: {
 					examples: ["app-name"]
+					syntax: "literal"
 				}
 			}
 			host: fields._local_host
@@ -64,6 +67,7 @@ components: sources: syslog: {
 				required:    true
 				type: string: {
 					examples: ["my.host.com"]
+					syntax: "literal"
 				}
 			}
 			facility: {
@@ -71,6 +75,7 @@ components: sources: syslog: {
 				required:    true
 				type: string: {
 					examples: ["1"]
+					syntax: "literal"
 				}
 			}
 			message: {
@@ -78,6 +83,7 @@ components: sources: syslog: {
 				required:    true
 				type: string: {
 					examples: ["Hello world"]
+					syntax: "literal"
 				}
 			}
 			msgid: {
@@ -85,6 +91,7 @@ components: sources: syslog: {
 				required:    true
 				type: string: {
 					examples: ["ID47"]
+					syntax: "literal"
 				}
 			}
 			procid: {
@@ -92,6 +99,7 @@ components: sources: syslog: {
 				required:    true
 				type: string: {
 					examples: ["8710"]
+					syntax: "literal"
 				}
 			}
 			severity: {
@@ -99,6 +107,7 @@ components: sources: syslog: {
 				required:    true
 				type: string: {
 					examples: ["notice"]
+					syntax: "literal"
 				}
 			}
 			source_ip: {
@@ -106,9 +115,14 @@ components: sources: syslog: {
 				required:    true
 				type: string: {
 					examples: ["127.0.0.1"]
+					syntax: "literal"
 				}
 			}
-			timestamp: fields._current_timestamp
+			timestamp: {
+				description: "The time extracted from the Syslog formatted line. If parsing fails, then the exact time the event was ingested into Vector is used."
+				required:    true
+				type: timestamp: {}
+			}
 			version: {
 				description: "The version extracted from the Syslog line. If a version is not found, then the key will not be added."
 				required:    true
@@ -120,7 +134,10 @@ components: sources: syslog: {
 			"*": {
 				description: "In addition to the defined fields, any Syslog 5424 structured fields are parsed and inserted as root level fields."
 				required:    true
-				type: string: examples: ["hello world"]
+				type: string: {
+					examples: ["hello world"]
+					syntax: "literal"
+				}
 			}
 		}
 	}
@@ -189,7 +206,10 @@ components: sources: syslog: {
 	}
 
 	telemetry: metrics: {
+		events_in_total:              components.sources.internal_metrics.output.metrics.events_in_total
 		connection_read_errors_total: components.sources.internal_metrics.output.metrics.connection_read_errors_total
+		processed_bytes_total:        components.sources.internal_metrics.output.metrics.processed_bytes_total
+		processed_events_total:       components.sources.internal_metrics.output.metrics.processed_events_total
 		utf8_convert_errors_total:    components.sources.internal_metrics.output.metrics.utf8_convert_errors_total
 	}
 }

@@ -15,22 +15,14 @@
 extern crate tracing;
 #[macro_use]
 extern crate derivative;
-#[macro_use]
-extern crate pest_derive;
 #[cfg(feature = "vrl-cli")]
-extern crate remap_cli;
-
-#[cfg(feature = "jemallocator")]
-#[global_allocator]
-static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
+extern crate vrl_cli;
 
 #[macro_use]
 pub mod config;
-pub mod buffers;
 pub mod cli;
 pub mod conditions;
 pub mod dns;
-pub mod event;
 pub mod expiring_hash_map;
 pub mod generate;
 #[cfg(feature = "wasm")]
@@ -41,18 +33,18 @@ pub mod internal_events;
 pub mod api;
 pub mod app;
 pub mod async_read;
+pub mod buffers;
+pub mod encoding_transcode;
 pub mod heartbeat;
 pub mod http;
-#[cfg(feature = "rdkafka")]
+#[cfg(any(feature = "sources-kafka", feature = "sinks-kafka"))]
 pub mod kafka;
 pub mod kubernetes;
 pub mod line_agg;
 pub mod list;
-pub mod mapping;
-pub mod metrics;
 pub(crate) mod pipeline;
-#[cfg(any(feature = "sinks-prometheus", feature = "sources-prometheus"))]
-pub(crate) mod prometheus;
+pub(crate) mod proto;
+pub mod providers;
 #[cfg(feature = "rusoto_core")]
 pub mod rusoto;
 pub mod serde;
@@ -62,7 +54,10 @@ pub mod signal;
 pub mod sink;
 pub mod sinks;
 pub mod sources;
+pub(crate) mod stats;
 pub mod stream;
+#[cfg(feature = "api-client")]
+mod tap;
 pub mod tcp;
 pub mod template;
 pub mod test_util;
@@ -74,17 +69,16 @@ pub mod trace;
 pub mod transforms;
 pub mod trigger;
 pub mod types;
+pub mod udp;
 pub mod unit_test;
+pub(crate) mod utilization;
 pub mod validate;
 #[cfg(windows)]
 pub mod vector_windows;
 
-pub use event::{Event, Value};
 pub use pipeline::Pipeline;
 
-pub type Error = Box<dyn std::error::Error + Send + Sync + 'static>;
-
-pub type Result<T> = std::result::Result<T, Error>;
+pub use vector_core::{event, mapping, metrics, Error, Result};
 
 pub fn vector_version() -> impl std::fmt::Display {
     #[cfg(feature = "nightly")]
@@ -98,40 +92,19 @@ pub fn vector_version() -> impl std::fmt::Display {
 
 pub fn get_version() -> String {
     let pkg_version = vector_version();
-    let commit_hash = built_info::GIT_VERSION.and_then(|v| v.split('-').last());
-    let built_date = chrono::DateTime::parse_from_rfc2822(built_info::BUILT_TIME_UTC)
-        .unwrap()
-        .format("%Y-%m-%d");
-    let built_string = if let Some(commit_hash) = commit_hash {
-        format!("{} {} {}", commit_hash, built_info::TARGET, built_date)
-    } else {
-        built_info::TARGET.into()
+    let build_desc = built_info::VECTOR_BUILD_DESC;
+    let build_string = match build_desc {
+        Some(desc) => format!("{} {}", built_info::TARGET, desc),
+        None => built_info::TARGET.into(),
     };
-    format!("{} ({})", pkg_version, built_string)
+    format!("{} ({})", pkg_version, build_string)
 }
 
 #[allow(unused)]
-mod built_info {
+pub mod built_info {
     include!(concat!(env!("OUT_DIR"), "/built.rs"));
 }
 
 pub fn get_hostname() -> std::io::Result<String> {
     Ok(hostname::get()?.to_string_lossy().into())
-}
-
-// This is a private implementation of the unstable `bool_to_option`
-// feature. This can be removed once this stabilizes:
-// https://github.com/rust-lang/rust/issues/64260
-trait BoolAndSome {
-    fn and_some<T>(self, value: T) -> Option<T>;
-}
-
-impl BoolAndSome for bool {
-    fn and_some<T>(self, value: T) -> Option<T> {
-        if self {
-            Some(value)
-        } else {
-            None
-        }
-    }
 }

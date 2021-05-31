@@ -10,6 +10,7 @@ use async_trait::async_trait;
 use component::ComponentDescription;
 use indexmap::IndexMap; // IndexMap preserves insertion order, allowing us to output errors in the same order they are present in the file
 use serde::{Deserialize, Serialize};
+use shared::TimeZone;
 use snafu::{ResultExt, Snafu};
 use std::collections::{HashMap, HashSet};
 use std::fmt::{self, Display, Formatter};
@@ -23,9 +24,9 @@ mod builder;
 mod compiler;
 pub mod component;
 mod diff;
-mod format;
+pub mod format;
 mod loading;
-mod log_schema;
+pub mod provider;
 mod unit_test;
 mod validation;
 mod vars;
@@ -34,10 +35,30 @@ pub mod watcher;
 pub use builder::ConfigBuilder;
 pub use diff::ConfigDiff;
 pub use format::{Format, FormatHint};
-pub use loading::{load_from_paths, load_from_str, merge_path_lists, process_paths, CONFIG_PATHS};
-pub use log_schema::{log_schema, LogSchema, LOG_SCHEMA};
+pub use loading::{
+    load, load_builder_from_paths, load_from_paths, load_from_paths_with_provider, load_from_str,
+    merge_path_lists, process_paths, CONFIG_PATHS,
+};
 pub use unit_test::build_unit_tests_main as build_unit_tests;
 pub use validation::warnings;
+pub use vector_core::config::{log_schema, LogSchema};
+
+/// Loads Log Schema from configurations and sets global schema.
+/// Once this is done, configurations can be correctly loaded using
+/// configured log schema defaults.
+/// If deny is set, will panic if schema has already been set.
+pub fn init_log_schema(
+    config_paths: &[(PathBuf, FormatHint)],
+    deny_if_set: bool,
+) -> Result<(), Vec<String>> {
+    vector_core::config::init_log_schema(
+        || {
+            let (builder, _) = load_builder_from_paths(config_paths)?;
+            Ok(builder.global.log_schema)
+        },
+        deny_if_set,
+    )
+}
 
 #[derive(Debug, Default)]
 pub struct Config {
@@ -45,22 +66,22 @@ pub struct Config {
     #[cfg(feature = "api")]
     pub api: api::Options,
     pub healthchecks: HealthcheckOptions,
-    pub sources: IndexMap<String, Box<dyn SourceConfig>>,
+    pub sources: IndexMap<String, SourceOuter>,
     pub sinks: IndexMap<String, SinkOuter>,
     pub transforms: IndexMap<String, TransformOuter>,
     tests: Vec<TestDefinition>,
     expansions: IndexMap<String, Vec<String>>,
 }
 
-#[derive(Default, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[serde(default)]
 pub struct GlobalOptions {
     #[serde(default = "default_data_dir")]
     pub data_dir: Option<PathBuf>,
-    #[serde(
-        skip_serializing_if = "crate::serde::skip_serializing_if_default",
-        default
-    )]
+    #[serde(skip_serializing_if = "crate::serde::skip_serializing_if_default")]
     pub log_schema: LogSchema,
+    #[serde(skip_serializing_if = "crate::serde::skip_serializing_if_default")]
+    pub timezone: TimeZone,
 }
 
 pub fn default_data_dir() -> Option<PathBuf> {
@@ -184,17 +205,31 @@ macro_rules! impl_generate_config_from_default {
     };
 }
 
-#[async_trait::async_trait]
+#[derive(Debug, Deserialize, Serialize)]
+pub struct SourceOuter {
+    #[serde(default = "default_acknowledgements")]
+    pub acknowledgements: bool,
+    #[serde(flatten)]
+    pub(super) inner: Box<dyn SourceConfig>,
+}
+
+fn default_acknowledgements() -> bool {
+    true
+}
+
+impl SourceOuter {
+    pub(crate) fn new(source: impl SourceConfig + 'static) -> Self {
+        Self {
+            acknowledgements: default_acknowledgements(),
+            inner: Box::new(source),
+        }
+    }
+}
+
 #[async_trait]
 #[typetag::serde(tag = "type")]
 pub trait SourceConfig: core::fmt::Debug + Send + Sync {
-    async fn build(
-        &self,
-        name: &str,
-        globals: &GlobalOptions,
-        shutdown: ShutdownSignal,
-        out: Pipeline,
-    ) -> crate::Result<sources::Source>;
+    async fn build(&self, cx: SourceContext) -> crate::Result<sources::Source>;
 
     fn output_type(&self) -> DataType;
 
@@ -203,6 +238,46 @@ pub trait SourceConfig: core::fmt::Debug + Send + Sync {
     /// Resources that the source is using.
     fn resources(&self) -> Vec<Resource> {
         Vec::new()
+    }
+}
+
+pub struct SourceContext {
+    pub name: String,
+    pub globals: GlobalOptions,
+    pub shutdown: ShutdownSignal,
+    pub out: Pipeline,
+    pub acknowledgements: bool,
+}
+
+impl SourceContext {
+    #[cfg(test)]
+    pub fn new_shutdown(
+        name: &str,
+        out: Pipeline,
+    ) -> (Self, crate::shutdown::SourceShutdownCoordinator) {
+        let mut shutdown = crate::shutdown::SourceShutdownCoordinator::default();
+        let (shutdown_signal, _) = shutdown.register_source(name);
+        (
+            Self {
+                name: name.into(),
+                globals: GlobalOptions::default(),
+                shutdown: shutdown_signal,
+                out,
+                acknowledgements: default_acknowledgements(),
+            },
+            shutdown,
+        )
+    }
+
+    #[cfg(test)]
+    pub fn new_test(out: Pipeline) -> Self {
+        Self {
+            name: "default".into(),
+            globals: GlobalOptions::default(),
+            shutdown: ShutdownSignal::noop(),
+            out,
+            acknowledgements: default_acknowledgements(),
+        }
     }
 }
 
@@ -316,6 +391,7 @@ pub trait SinkConfig: core::fmt::Debug + Send + Sync {
 pub struct SinkContext {
     pub(super) acker: Acker,
     pub(super) healthcheck: SinkHealthcheckOptions,
+    pub(super) globals: GlobalOptions,
 }
 
 impl SinkContext {
@@ -324,11 +400,16 @@ impl SinkContext {
         Self {
             acker: Acker::Null,
             healthcheck: SinkHealthcheckOptions::default(),
+            globals: GlobalOptions::default(),
         }
     }
 
     pub fn acker(&self) -> Acker {
         self.acker.clone()
+    }
+
+    pub fn globals(&self) -> &GlobalOptions {
+        &self.globals
     }
 }
 
@@ -346,7 +427,7 @@ pub struct TransformOuter {
 #[async_trait]
 #[typetag::serde(tag = "type")]
 pub trait TransformConfig: core::fmt::Debug + Send + Sync + dyn_clone::DynClone {
-    async fn build(&self) -> crate::Result<transforms::Transform>;
+    async fn build(&self, globals: &GlobalOptions) -> crate::Result<transforms::Transform>;
 
     fn input_type(&self) -> DataType;
 
@@ -495,15 +576,7 @@ fn default_test_input_type() -> String {
 #[serde(deny_unknown_fields)]
 pub struct TestOutput {
     pub extract_from: String,
-    pub conditions: Option<Vec<TestCondition>>,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-#[serde(untagged)]
-pub enum TestCondition {
-    Embedded(Box<dyn conditions::ConditionConfig>),
-    NoTypeEmbedded(conditions::CheckFieldsConfig),
-    String(String),
+    pub conditions: Option<Vec<conditions::AnyCondition>>,
 }
 
 impl Config {
@@ -522,19 +595,6 @@ impl Config {
     }
 }
 
-fn handle_warnings(warnings: Vec<String>, deny_warnings: bool) -> Result<(), Vec<String>> {
-    if !warnings.is_empty() {
-        if deny_warnings {
-            return Err(warnings);
-        } else {
-            for warning in warnings {
-                warn!("{}", &warning);
-            }
-        }
-    }
-    Ok(())
-}
-
 #[cfg(all(
     test,
     feature = "sources-file",
@@ -543,22 +603,23 @@ fn handle_warnings(warnings: Vec<String>, deny_warnings: bool) -> Result<(), Vec
 ))]
 mod test {
     use super::{builder::ConfigBuilder, format, load_from_str, Format};
+    use indoc::indoc;
     use std::path::PathBuf;
 
     #[test]
     fn default_data_dir() {
         let config = load_from_str(
-            r#"
-            [sources.in]
-            type = "file"
-            include = ["/var/log/messages"]
+            indoc! {r#"
+                [sources.in]
+                  type = "file"
+                  include = ["/var/log/messages"]
 
-            [sinks.out]
-            type = "console"
-            inputs = ["in"]
-            encoding = "json"
-            "#,
-            Some(Format::TOML),
+                [sinks.out]
+                  type = "console"
+                  inputs = ["in"]
+                  encoding = "json"
+            "#},
+            Some(Format::Toml),
         )
         .unwrap();
 
@@ -571,17 +632,17 @@ mod test {
     #[test]
     fn default_schema() {
         let config = load_from_str(
-            r#"
-            [sources.in]
-            type = "file"
-            include = ["/var/log/messages"]
+            indoc! {r#"
+                [sources.in]
+                  type = "file"
+                  include = ["/var/log/messages"]
 
-            [sinks.out]
-            type = "console"
-            inputs = ["in"]
-            encoding = "json"
-            "#,
-            Some(Format::TOML),
+                [sinks.out]
+                  type = "console"
+                  inputs = ["in"]
+                  encoding = "json"
+            "#},
+            Some(Format::Toml),
         )
         .unwrap();
 
@@ -599,22 +660,22 @@ mod test {
     #[test]
     fn custom_schema() {
         let config = load_from_str(
-            r#"
-            [log_schema]
-            host_key = "this"
-            message_key = "that"
-            timestamp_key = "then"
+            indoc! {r#"
+                [log_schema]
+                  host_key = "this"
+                  message_key = "that"
+                  timestamp_key = "then"
 
-            [sources.in]
-            type = "file"
-            include = ["/var/log/messages"]
+                [sources.in]
+                  type = "file"
+                  include = ["/var/log/messages"]
 
-            [sinks.out]
-            type = "console"
-            inputs = ["in"]
-            encoding = "json"
-            "#,
-            Some(Format::TOML),
+                [sinks.out]
+                  type = "console"
+                  inputs = ["in"]
+                  encoding = "json"
+            "#},
+            Some(Format::Toml),
         )
         .unwrap();
 
@@ -626,43 +687,43 @@ mod test {
     #[test]
     fn config_append() {
         let mut config: ConfigBuilder = format::deserialize(
-            r#"
-            [sources.in]
-            type = "file"
-            include = ["/var/log/messages"]
+            indoc! {r#"
+                [sources.in]
+                  type = "file"
+                  include = ["/var/log/messages"]
 
-            [sinks.out]
-            type = "console"
-            inputs = ["in"]
-            encoding = "json"
-            "#,
-            Some(Format::TOML),
+                [sinks.out]
+                  type = "console"
+                  inputs = ["in"]
+                  encoding = "json"
+            "#},
+            Some(Format::Toml),
         )
         .unwrap();
 
         assert_eq!(
             config.append(
                 format::deserialize(
-                    r#"
-                    data_dir = "/foobar"
+                    indoc! {r#"
+                        data_dir = "/foobar"
 
-                    [transforms.foo]
-                    type = "json_parser"
-                    inputs = [ "in" ]
+                        [transforms.foo]
+                          type = "json_parser"
+                          inputs = [ "in" ]
 
-                    [[tests]]
-                    name = "check_simple_log"
-                    [tests.input]
-                    insert_at = "foo"
-                    type = "raw"
-                    value = "2019-11-28T12:00:00+00:00 info Sorry, I'm busy this week Cecil"
-                    [[tests.outputs]]
-                    extract_from = "foo"
-                    [[tests.outputs.conditions]]
-                    type = "check_fields"
-                    "message.equals" = "Sorry, I'm busy this week Cecil"
-                    "#,
-                    Some(Format::TOML),
+                        [[tests]]
+                          name = "check_simple_log"
+                          [tests.input]
+                            insert_at = "foo"
+                            type = "raw"
+                            value = "2019-11-28T12:00:00+00:00 info Sorry, I'm busy this week Cecil"
+                          [[tests.outputs]]
+                            extract_from = "foo"
+                            [[tests.outputs.conditions]]
+                              type = "check_fields"
+                              "message.equals" = "Sorry, I'm busy this week Cecil"
+                    "#},
+                    Some(Format::Toml),
                 )
                 .unwrap()
             ),
@@ -679,38 +740,38 @@ mod test {
     #[test]
     fn config_append_collisions() {
         let mut config: ConfigBuilder = format::deserialize(
-            r#"
-            [sources.in]
-            type = "file"
-            include = ["/var/log/messages"]
+            indoc! {r#"
+                [sources.in]
+                  type = "file"
+                  include = ["/var/log/messages"]
 
-            [sinks.out]
-            type = "console"
-            inputs = ["in"]
-            encoding = "json"
-            "#,
-            Some(Format::TOML),
+                [sinks.out]
+                  type = "console"
+                  inputs = ["in"]
+                  encoding = "json"
+            "#},
+            Some(Format::Toml),
         )
         .unwrap();
 
         assert_eq!(
             config.append(
                 format::deserialize(
-                    r#"
-                    [sources.in]
-                    type = "file"
-                    include = ["/var/log/messages"]
+                    indoc! {r#"
+                        [sources.in]
+                          type = "file"
+                          include = ["/var/log/messages"]
 
-                    [transforms.foo]
-                    type = "json_parser"
-                    inputs = [ "in" ]
+                        [transforms.foo]
+                          type = "json_parser"
+                          inputs = [ "in" ]
 
-                    [sinks.out]
-                    type = "console"
-                    inputs = ["in"]
-                    encoding = "json"
-                    "#,
-                    Some(Format::TOML),
+                        [sinks.out]
+                          type = "console"
+                          inputs = ["in"]
+                          encoding = "json"
+                    "#},
+                    Some(Format::Toml),
                 )
                 .unwrap()
             ),
@@ -725,6 +786,7 @@ mod test {
 #[cfg(all(test, feature = "sources-stdin", feature = "sinks-console"))]
 mod resource_tests {
     use super::{load_from_str, Format, Resource};
+    use indoc::indoc;
     use std::collections::{HashMap, HashSet};
     use std::net::{Ipv4Addr, SocketAddr};
 
@@ -841,19 +903,19 @@ mod resource_tests {
     #[test]
     fn config_conflict_detected() {
         assert!(load_from_str(
-            r#"
-            [sources.in0]
-            type = "stdin"
+            indoc! {r#"
+                [sources.in0]
+                  type = "stdin"
 
-            [sources.in1]
-            type = "stdin"
+                [sources.in1]
+                  type = "stdin"
 
-            [sinks.out]
-            type = "console"
-            inputs = ["in0","in1"]
-            encoding = "json"
-            "#,
-            Some(Format::TOML),
+                [sinks.out]
+                  type = "console"
+                  inputs = ["in0","in1"]
+                  encoding = "json"
+            "#},
+            Some(Format::Toml),
         )
         .is_err());
     }

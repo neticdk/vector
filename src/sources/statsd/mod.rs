@@ -1,11 +1,13 @@
+use crate::udp;
 use crate::{
-    config::{self, GenerateConfig, GlobalOptions, Resource, SourceConfig, SourceDescription},
+    config::{self, GenerateConfig, Resource, SourceConfig, SourceContext, SourceDescription},
+    event::Event,
     internal_events::{StatsdEventReceived, StatsdInvalidRecord, StatsdSocketError},
     shutdown::ShutdownSignal,
     sources::util::{SocketListenAddr, TcpSource},
     tcp::TcpKeepaliveConfig,
     tls::{MaybeTlsSettings, TlsConfig},
-    Event, Pipeline,
+    Pipeline,
 };
 use bytes::Bytes;
 use codec::BytesDelimitedCodec;
@@ -34,7 +36,17 @@ enum StatsdConfig {
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct UdpConfig {
-    pub address: SocketAddr,
+    address: SocketAddr,
+    receive_buffer_bytes: Option<usize>,
+}
+
+impl UdpConfig {
+    pub fn from_address(address: SocketAddr) -> Self {
+        Self {
+            address,
+            receive_buffer_bytes: None,
+        }
+    }
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
@@ -44,7 +56,21 @@ struct TcpConfig {
     #[serde(default)]
     tls: Option<TlsConfig>,
     #[serde(default = "default_shutdown_timeout_secs")]
-    pub shutdown_timeout_secs: u64,
+    shutdown_timeout_secs: u64,
+    receive_buffer_bytes: Option<usize>,
+}
+
+impl TcpConfig {
+    #[cfg(all(test, feature = "sinks-prometheus"))]
+    pub fn from_address(address: SocketListenAddr) -> Self {
+        Self {
+            address,
+            keepalive: None,
+            tls: None,
+            shutdown_timeout_secs: default_shutdown_timeout_secs(),
+            receive_buffer_bytes: None,
+        }
+    }
 }
 
 fn default_shutdown_timeout_secs() -> u64 {
@@ -57,9 +83,9 @@ inventory::submit! {
 
 impl GenerateConfig for StatsdConfig {
     fn generate_config() -> toml::Value {
-        toml::Value::try_from(Self::Udp(UdpConfig {
-            address: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 8125)),
-        }))
+        toml::Value::try_from(Self::Udp(UdpConfig::from_address(SocketAddr::V4(
+            SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 8125),
+        ))))
         .unwrap()
     }
 }
@@ -67,15 +93,11 @@ impl GenerateConfig for StatsdConfig {
 #[async_trait::async_trait]
 #[typetag::serde(name = "statsd")]
 impl SourceConfig for StatsdConfig {
-    async fn build(
-        &self,
-        _name: &str,
-        _globals: &GlobalOptions,
-        shutdown: ShutdownSignal,
-        out: Pipeline,
-    ) -> crate::Result<super::Source> {
+    async fn build(&self, cx: SourceContext) -> crate::Result<super::Source> {
         match self {
-            StatsdConfig::Udp(config) => Ok(Box::pin(statsd_udp(config.clone(), shutdown, out))),
+            StatsdConfig::Udp(config) => {
+                Ok(Box::pin(statsd_udp(config.clone(), cx.shutdown, cx.out)))
+            }
             StatsdConfig::Tcp(config) => {
                 let tls = MaybeTlsSettings::from_config(&config.tls, true)?;
                 StatsdTcpSource.run(
@@ -83,12 +105,13 @@ impl SourceConfig for StatsdConfig {
                     config.keepalive,
                     config.shutdown_timeout_secs,
                     tls,
-                    shutdown,
-                    out,
+                    config.receive_buffer_bytes,
+                    cx.shutdown,
+                    cx.out,
                 )
             }
             #[cfg(unix)]
-            StatsdConfig::Unix(config) => Ok(statsd_unix(config.clone(), shutdown, out)),
+            StatsdConfig::Unix(config) => Ok(statsd_unix(config.clone(), cx.shutdown, cx.out)),
         }
     }
 
@@ -133,6 +156,12 @@ async fn statsd_udp(
     let socket = UdpSocket::bind(&config.address)
         .map_err(|error| emit!(StatsdSocketError::bind(error)))
         .await?;
+
+    if let Some(receive_buffer_bytes) = config.receive_buffer_bytes {
+        if let Err(error) = udp::set_receive_buffer_size(&socket, receive_buffer_bytes) {
+            warn!(message = "Failed configuring receive buffer size on UDP socket.", %error);
+        }
+    }
 
     info!(
         message = "Listening.",
@@ -190,11 +219,10 @@ mod test {
         sinks::prometheus::exporter::PrometheusExporterConfig,
         test_util::{next_addr, start_topology},
     };
-    use futures::compat::Future01CompatExt;
+    use futures::channel::mpsc;
     use hyper::body::to_bytes as body_to_bytes;
     use tokio::io::AsyncWriteExt;
-    use tokio::sync::mpsc;
-    use tokio::time::{delay_for, Duration};
+    use tokio::time::{sleep, Duration};
 
     #[test]
     fn generate_config() {
@@ -214,13 +242,13 @@ mod test {
     #[tokio::test]
     async fn test_statsd_udp() {
         let in_addr = next_addr();
-        let config = StatsdConfig::Udp(UdpConfig { address: in_addr });
+        let config = StatsdConfig::Udp(UdpConfig::from_address(in_addr));
         let (sender, mut receiver) = mpsc::channel(200);
         tokio::spawn(async move {
             let bind_addr = next_addr();
-            let mut socket = UdpSocket::bind(bind_addr).await.unwrap();
+            let socket = UdpSocket::bind(bind_addr).await.unwrap();
             socket.connect(in_addr).await.unwrap();
-            while let Some(bytes) = receiver.recv().await {
+            while let Some(bytes) = receiver.next().await {
                 socket.send(bytes).await.unwrap();
             }
         });
@@ -230,15 +258,10 @@ mod test {
     #[tokio::test]
     async fn test_statsd_tcp() {
         let in_addr = next_addr();
-        let config = StatsdConfig::Tcp(TcpConfig {
-            address: in_addr.into(),
-            keepalive: None,
-            tls: None,
-            shutdown_timeout_secs: 30,
-        });
+        let config = StatsdConfig::Tcp(TcpConfig::from_address(in_addr.into()));
         let (sender, mut receiver) = mpsc::channel(200);
         tokio::spawn(async move {
-            while let Some(bytes) = receiver.recv().await {
+            while let Some(bytes) = receiver.next().await {
                 tokio::net::TcpStream::connect(in_addr)
                     .await
                     .unwrap()
@@ -259,7 +282,7 @@ mod test {
         });
         let (sender, mut receiver) = mpsc::channel(200);
         tokio::spawn(async move {
-            while let Some(bytes) = receiver.recv().await {
+            while let Some(bytes) = receiver.next().await {
                 tokio::net::UnixStream::connect(&in_path)
                     .await
                     .unwrap()
@@ -286,6 +309,7 @@ mod test {
             &["in"],
             PrometheusExporterConfig {
                 address: out_addr,
+                tls: None,
                 default_namespace: Some("vector".into()),
                 buckets: vec![1.0, 2.0, 4.0],
                 quantiles: vec![],
@@ -296,18 +320,18 @@ mod test {
         let (topology, _crash) = start_topology(config.build().unwrap(), false).await;
 
         // Give some time for the topology to start
-        delay_for(Duration::from_millis(100)).await;
+        sleep(Duration::from_millis(100)).await;
 
         for _ in 0..100 {
             sender.send(
                 b"foo:1|c|#a,b:b\nbar:42|g\nfoo:1|c|#a,b:c\nglork:3|h|@0.1\nmilliglork:3000|ms|@0.1\nset:0|s\nset:1|s\n"
             ).await.unwrap();
             // Space things out slightly to try to avoid dropped packets
-            delay_for(Duration::from_millis(10)).await;
+            sleep(Duration::from_millis(10)).await;
         }
 
         // Give packets some time to flow through
-        delay_for(Duration::from_millis(100)).await;
+        sleep(Duration::from_millis(100)).await;
 
         let client = hyper::Client::new();
         let response = client
@@ -355,7 +379,7 @@ mod test {
         // Flush test
         {
             // Wait for flush to happen
-            delay_for(Duration::from_millis(2000)).await;
+            sleep(Duration::from_millis(2000)).await;
 
             let response = client
                 .get(format!("http://{}/metrics", out_addr).parse().unwrap())
@@ -376,7 +400,7 @@ mod test {
 
             sender.send(b"set:0|s\nset:1|s\n").await.unwrap();
             // Give packets some time to flow through
-            delay_for(Duration::from_millis(100)).await;
+            sleep(Duration::from_millis(100)).await;
 
             let response = client
                 .get(format!("http://{}/metrics", out_addr).parse().unwrap())
@@ -395,6 +419,6 @@ mod test {
         }
 
         // Shut down server
-        topology.stop().compat().await.unwrap();
+        topology.stop().await;
     }
 }

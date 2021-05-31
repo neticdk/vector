@@ -1,20 +1,22 @@
 use super::{healthcheck_response, GcpAuthConfig, GcpCredentials, Scope};
 use crate::{
     config::{DataType, GenerateConfig, SinkConfig, SinkContext, SinkDescription},
+    event::Event,
     http::{HttpClient, HttpClientFuture, HttpError},
+    internal_events::TemplateRenderingFailed,
     serde::to_string,
     sinks::{
         util::{
+            batch::{BatchConfig, BatchSettings},
             encoding::{EncodingConfig, EncodingConfiguration},
             retries::{RetryAction, RetryLogic},
-            BatchConfig, BatchSettings, Buffer, Compression, Concurrency, PartitionBatchSink,
-            PartitionBuffer, PartitionInnerBuffer, ServiceBuilderExt, TowerRequestConfig,
+            Buffer, Compression, Concurrency, EncodedEvent, PartitionBatchSink, PartitionBuffer,
+            PartitionInnerBuffer, ServiceBuilderExt, TowerRequestConfig,
         },
         Healthcheck, VectorSink,
     },
-    template::{Template, TemplateError},
+    template::{Template, TemplateParseError},
     tls::{TlsOptions, TlsSettings},
-    Event,
 };
 use bytes::Bytes;
 use chrono::Utc;
@@ -24,6 +26,7 @@ use hyper::{
     header::{HeaderName, HeaderValue},
     Body, Request, Response,
 };
+use indoc::indoc;
 use lazy_static::lazy_static;
 use serde::{Deserialize, Serialize};
 use snafu::{ResultExt, Snafu};
@@ -146,11 +149,11 @@ inventory::submit! {
 
 impl GenerateConfig for GcsSinkConfig {
     fn generate_config() -> toml::Value {
-        toml::from_str(
-            r#"bucket = "my-bucket"
+        toml::from_str(indoc! {r#"
+            bucket = "my-bucket"
             credentials_path = "/path/to/credentials.json"
-            encoding.codec = "ndjson""#,
-        )
+            encoding.codec = "ndjson"
+        "#})
         .unwrap()
     }
 }
@@ -182,7 +185,7 @@ enum HealthcheckError {
     #[snafu(display("Unknown bucket: {:?}", bucket))]
     UnknownBucket { bucket: String },
     #[snafu(display("key_prefix template parse error: {}", source))]
-    KeyPrefixTemplate { source: TemplateError },
+    KeyPrefixTemplate { source: TemplateParseError },
 }
 
 impl GcsSink {
@@ -197,11 +200,11 @@ impl GcsSink {
         let base_url = format!("{}{}/", BASE_URL, config.bucket);
         let bucket = config.bucket.clone();
         Ok(GcsSink {
+            bucket,
             client,
             creds,
-            settings,
             base_url,
-            bucket,
+            settings,
         })
     }
 
@@ -228,7 +231,9 @@ impl GcsSink {
 
         let sink = PartitionBatchSink::new(svc, buffer, batch.timeout, cx.acker())
             .sink_map_err(|error| error!(message = "Fatal gcp_cloud_storage error.", %error))
-            .with_flat_map(move |e| stream::iter(encode_event(e, &key_prefix, &encoding)).map(Ok));
+            .with_flat_map(move |event| {
+                stream::iter(encode_event(event, &key_prefix, &encoding)).map(Ok)
+            });
 
         Ok(VectorSink::Sink(Box::new(sink)))
     }
@@ -400,15 +405,15 @@ fn encode_event(
     mut event: Event,
     key_prefix: &Template,
     encoding: &EncodingConfig<Encoding>,
-) -> Option<PartitionInnerBuffer<Vec<u8>, Bytes>> {
+) -> Option<EncodedEvent<PartitionInnerBuffer<Vec<u8>, Bytes>>> {
     let key = key_prefix
         .render_string(&event)
-        .map_err(|missing_keys| {
-            warn!(
-                message = "Keys do not exist on the event; dropping event.",
-                ?missing_keys,
-                internal_log_rate_secs = 30,
-            );
+        .map_err(|error| {
+            emit!(TemplateRenderingFailed {
+                error,
+                field: Some("key_prefix"),
+                drop_event: true,
+            });
         })
         .ok()?;
     encoding.apply_rules(&mut event);
@@ -430,7 +435,10 @@ fn encode_event(
         }
     };
 
-    Some(PartitionInnerBuffer::new(bytes, key.into()))
+    Some(EncodedEvent::new(PartitionInnerBuffer::new(
+        bytes,
+        key.into(),
+    )))
 }
 
 #[derive(Clone)]
@@ -473,7 +481,7 @@ mod tests {
     fn gcs_encode_event_text() {
         let message = "hello world".to_string();
         let batch_time_format = Template::try_from("date=%F").unwrap();
-        let bytes = encode_event(
+        let encoded = encode_event(
             message.clone().into(),
             &batch_time_format,
             &Encoding::Text.into(),
@@ -481,7 +489,7 @@ mod tests {
         .unwrap();
 
         let encoded_message = message + "\n";
-        let (bytes, _) = bytes.into_parts();
+        let (bytes, _) = encoded.item.into_parts();
         assert_eq!(&bytes[..], encoded_message.as_bytes());
     }
 
@@ -492,9 +500,9 @@ mod tests {
         event.as_mut_log().insert("key", "value");
 
         let batch_time_format = Template::try_from("date=%F").unwrap();
-        let bytes = encode_event(event, &batch_time_format, &Encoding::Ndjson.into()).unwrap();
+        let encoded = encode_event(event, &batch_time_format, &Encoding::Ndjson.into()).unwrap();
 
-        let (bytes, _) = bytes.into_parts();
+        let (bytes, _) = encoded.item.into_parts();
         let map: HashMap<String, String> = serde_json::from_slice(&bytes[..]).unwrap();
 
         assert_eq!(
@@ -513,9 +521,9 @@ mod tests {
         event.as_mut_log().insert("key", "value");
 
         let key_format = Template::try_from("key: {{ key }}").unwrap();
-        let bytes = encode_event(event, &key_format, &Encoding::Text.into()).unwrap();
+        let encoded = encode_event(event, &key_format, &Encoding::Text.into()).unwrap();
 
-        let (_, key) = bytes.into_parts();
+        let (_, key) = encoded.item.into_parts();
         assert_eq!(key, "key: value");
     }
 

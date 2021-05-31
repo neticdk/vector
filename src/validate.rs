@@ -23,21 +23,22 @@ pub struct Opts {
     deny_warnings: bool,
 
     /// Vector config files in TOML format to validate.
-    #[structopt(name = "config-toml", long)]
+    #[structopt(name = "config-toml", long, use_delimiter(true))]
     paths_toml: Vec<PathBuf>,
 
     /// Vector config files in JSON format to validate.
-    #[structopt(name = "config-json", long)]
+    #[structopt(name = "config-json", long, use_delimiter(true))]
     paths_json: Vec<PathBuf>,
 
     /// Vector config files in YAML format to validate.
-    #[structopt(name = "config-yaml", long)]
+    #[structopt(name = "config-yaml", long, use_delimiter(true))]
     paths_yaml: Vec<PathBuf>,
 
     /// Any number of Vector config files to validate.
     /// Format is detected from the file name.
     /// If none are specified the default config path `/etc/vector/vector.toml`
     /// will be targeted.
+    #[structopt(use_delimiter(true))]
     paths: Vec<PathBuf>,
 }
 
@@ -45,9 +46,9 @@ impl Opts {
     fn paths_with_formats(&self) -> Vec<(PathBuf, config::FormatHint)> {
         config::merge_path_lists(vec![
             (&self.paths, None),
-            (&self.paths_toml, Some(config::Format::TOML)),
-            (&self.paths_json, Some(config::Format::JSON)),
-            (&self.paths_yaml, Some(config::Format::YAML)),
+            (&self.paths_toml, Some(config::Format::Toml)),
+            (&self.paths_json, Some(config::Format::Json)),
+            (&self.paths_yaml, Some(config::Format::Yaml)),
         ])
     }
 }
@@ -80,8 +81,6 @@ pub async fn validate(opts: &Opts, color: bool) -> ExitCode {
     }
 }
 
-/// Ok if all configs were successfully validated.
-/// Err Some contains only successfully validated configs.
 fn validate_config(opts: &Opts, fmt: &mut Formatter) -> Option<Config> {
     // Prepare paths
     let paths = opts.paths_with_formats();
@@ -92,18 +91,43 @@ fn validate_config(opts: &Opts, fmt: &mut Formatter) -> Option<Config> {
         return None;
     };
 
+    // Load
     let paths_list: Vec<_> = paths.iter().map(|(path, _)| path).collect();
-    match config::load_from_paths(&paths, opts.deny_warnings) {
-        Ok(config) => {
-            fmt.success(format!("Loaded {:?}", &paths_list));
-            Some(config)
+    let mut report_error = |errors| {
+        fmt.title(format!("Failed to load {:?}", &paths_list));
+        fmt.sub_error(errors);
+    };
+    config::init_log_schema(&paths, true)
+        .map_err(&mut report_error)
+        .ok()?;
+    let (builder, load_warnings) = config::load_builder_from_paths(&paths)
+        .map_err(&mut report_error)
+        .ok()?;
+
+    // Build
+    let (config, build_warnings) = builder
+        .build_with_warnings()
+        .map_err(&mut report_error)
+        .ok()?;
+
+    // Warnings
+    let warnings = load_warnings
+        .into_iter()
+        .chain(build_warnings)
+        .collect::<Vec<_>>();
+    if !warnings.is_empty() {
+        if opts.deny_warnings {
+            report_error(warnings);
+            return None;
         }
-        Err(errors) => {
-            fmt.title(format!("Failed to load {:?}", &paths_list));
-            fmt.sub_error(errors);
-            None
-        }
+
+        fmt.title(format!("Loaded with warnings {:?}", &paths_list));
+        fmt.sub_warning(warnings);
+    } else {
+        fmt.success(format!("Loaded {:?}", &paths_list));
     }
+
+    Some(config)
 }
 
 async fn validate_environment(opts: &Opts, config: &Config, fmt: &mut Formatter) -> bool {
@@ -123,10 +147,6 @@ async fn validate_components(
     diff: &ConfigDiff,
     fmt: &mut Formatter,
 ) -> Option<Pieces> {
-    crate::config::LOG_SCHEMA
-        .set(config.global.log_schema.clone())
-        .expect("Couldn't set schema");
-
     match topology::builder::build_pieces(config, diff, HashMap::new()).await {
         Ok(pieces) => {
             fmt.success("Component configuration");
@@ -147,7 +167,7 @@ async fn validate_healthchecks(
     pieces: &mut Pieces,
     fmt: &mut Formatter,
 ) -> bool {
-    if config.healthchecks.enabled {
+    if !config.healthchecks.enabled {
         fmt.warning("Health checks are disabled");
         return !opts.deny_warnings;
     }
@@ -292,6 +312,14 @@ impl Formatter {
             "",
             width = title.as_ref().len()
         ))
+    }
+
+    /// A list of warnings that go with a title.
+    fn sub_warning<I: IntoIterator>(&mut self, warnings: I)
+    where
+        I::Item: fmt::Display,
+    {
+        self.sub(self.warning_intro.clone(), warnings)
     }
 
     /// A list of errors that go with a title.

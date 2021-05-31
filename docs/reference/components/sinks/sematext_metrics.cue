@@ -9,6 +9,7 @@ components: sinks: sematext_metrics: {
 		development:   "beta"
 		service_providers: ["Sematext"]
 		egress_method: "batch"
+		stateful:      false
 	}
 
 	features: {
@@ -19,7 +20,6 @@ components: sinks: sematext_metrics: {
 				enabled:      true
 				common:       false
 				max_bytes:    30000000
-				max_events:   null
 				timeout_secs: 1
 			}
 			compression: enabled: false
@@ -35,14 +35,15 @@ components: sinks: sematext_metrics: {
 
 	support: {
 		targets: {
-			"aarch64-unknown-linux-gnu":  true
-			"aarch64-unknown-linux-musl": true
-			"x86_64-apple-darwin":        true
-			"x86_64-pc-windows-msv":      true
-			"x86_64-unknown-linux-gnu":   true
-			"x86_64-unknown-linux-musl":  true
+			"aarch64-unknown-linux-gnu":      true
+			"aarch64-unknown-linux-musl":     true
+			"armv7-unknown-linux-gnueabihf":  true
+			"armv7-unknown-linux-musleabihf": true
+			"x86_64-apple-darwin":            true
+			"x86_64-pc-windows-msv":          true
+			"x86_64-unknown-linux-gnu":       true
+			"x86_64-unknown-linux-musl":      true
 		}
-
 		requirements: []
 		warnings: [
 			"""
@@ -62,6 +63,7 @@ components: sinks: sematext_metrics: {
 			warnings: []
 			type: string: {
 				examples: ["service"]
+				syntax: "literal"
 			}
 		}
 	}
@@ -79,7 +81,7 @@ components: sinks: sematext_metrics: {
 	}
 
 	telemetry: metrics: {
-		processing_errors_total: components.sources.internal_metrics.output.metrics.processing_errors_total
 		encode_errors_total:     components.sources.internal_metrics.output.metrics.encode_errors_total
+		processing_errors_total: components.sources.internal_metrics.output.metrics.processing_errors_total
 	}
 }

@@ -3,12 +3,14 @@ mod request;
 use crate::{
     config::{log_schema, DataType, GenerateConfig, SinkConfig, SinkContext, SinkDescription},
     event::{Event, LogEvent, Value},
-    rusoto::{self, RegionOrEndpoint},
+    internal_events::TemplateRenderingFailed,
+    rusoto::{self, AwsAuthentication, RegionOrEndpoint},
     sinks::util::{
+        batch::{BatchConfig, BatchSettings},
         encoding::{EncodingConfig, EncodingConfiguration},
         retries::{FixedRetryPolicy, RetryLogic},
-        BatchConfig, BatchSettings, Compression, EncodedLength, PartitionBatchSink,
-        PartitionBuffer, PartitionInnerBuffer, TowerRequestConfig, TowerRequestSettings, VecBuffer,
+        Compression, EncodedEvent, EncodedLength, PartitionBatchSink, PartitionBuffer,
+        PartitionInnerBuffer, TowerRequestConfig, TowerRequestSettings, VecBuffer,
     },
     template::Template,
 };
@@ -72,7 +74,10 @@ pub struct CloudwatchLogsSinkConfig {
     pub batch: BatchConfig,
     #[serde(default)]
     pub request: TowerRequestConfig<Option<usize>>,
-    pub assume_role: Option<String>,
+    // Deprecated name. Moved to auth.
+    assume_role: Option<String>,
+    #[serde(default)]
+    pub auth: AwsAuthentication,
 }
 
 inventory::submit! {
@@ -97,6 +102,7 @@ fn default_config(e: Encoding) -> CloudwatchLogsSinkConfig {
         batch: Default::default(),
         request: Default::default(),
         assume_role: Default::default(),
+        auth: Default::default(),
     }
 }
 
@@ -158,7 +164,7 @@ impl CloudwatchLogsSinkConfig {
         let region = (&self.region).try_into()?;
 
         let client = rusoto::client()?;
-        let creds = rusoto::AwsCredentialsProvider::new(&region, self.assume_role.clone())?;
+        let creds = self.auth.build(&region, self.assume_role.clone())?;
 
         let client = rusoto_core::Client::new_with_encoding(creds, client, self.compression.into());
         Ok(CloudWatchLogsClient::new_with_client(client, region))
@@ -435,32 +441,32 @@ fn partition_encode(
     encoding: &EncodingConfig<Encoding>,
     group: &Template,
     stream: &Template,
-) -> Option<PartitionInnerBuffer<InputLogEvent, CloudwatchKey>> {
+) -> Option<EncodedEvent<PartitionInnerBuffer<InputLogEvent, CloudwatchKey>>> {
     let group = match group.render_string(&event) {
         Ok(b) => b,
-        Err(missing_keys) => {
-            warn!(
-                message = "Keys in group template do not exist on the event; dropping event.",
-                ?missing_keys,
-                internal_log_rate_secs = 30
-            );
+        Err(error) => {
+            emit!(TemplateRenderingFailed {
+                error,
+                field: Some("group"),
+                drop_event: true,
+            });
             return None;
         }
     };
 
     let stream = match stream.render_string(&event) {
         Ok(b) => b,
-        Err(missing_keys) => {
-            warn!(
-                message = "Keys in stream template do not exist on the event; dropping event.",
-                ?missing_keys,
-                internal_log_rate_secs = 30
-            );
+        Err(error) => {
+            emit!(TemplateRenderingFailed {
+                error,
+                field: Some("stream"),
+                drop_event: true,
+            });
             return None;
         }
     };
 
-    let key = CloudwatchKey { stream, group };
+    let key = CloudwatchKey { group, stream };
 
     encoding.apply_rules(&mut event);
     let event = encode_log(event.into_log(), encoding)
@@ -469,13 +475,13 @@ fn partition_encode(
         )
         .ok()?;
 
-    Some(PartitionInnerBuffer::new(event, key))
+    Some(EncodedEvent::new(PartitionInnerBuffer::new(event, key)))
 }
 
 #[derive(Debug, Snafu)]
 enum HealthcheckError {
-    #[snafu(display("DescribeLogStreams failed: {}", source))]
-    DescribeLogStreamsFailed {
+    #[snafu(display("DescribeLogGroups failed: {}", source))]
+    DescribeLogGroupsFailed {
         source: RusotoError<rusoto_logs::DescribeLogGroupsError>,
     },
     #[snafu(display("No log group found"))]
@@ -490,11 +496,6 @@ async fn healthcheck(
     config: CloudwatchLogsSinkConfig,
     client: CloudWatchLogsClient,
 ) -> crate::Result<()> {
-    if config.group_name.is_dynamic() {
-        info!("Cloudwatch group_name is dynamic; skipping healthcheck.");
-        return Ok(());
-    }
-
     let group_name = config.group_name.get_ref().to_owned();
     let expected_group_name = group_name.clone();
 
@@ -523,9 +524,19 @@ async fn healthcheck(
                     Err(HealthcheckError::GroupNameError.into())
                 }
             }
-            None => Err(HealthcheckError::NoLogGroup.into()),
+            None => {
+                if config.group_name.is_dynamic() {
+                    info!("Skipping healthcheck log group check: `group_name` is dynamic.");
+                    return Ok(());
+                } else if config.create_missing_group.unwrap_or(true) {
+                    info!("Skipping healthcheck log group check: `group_name` will be created if missing.");
+                    return Ok(());
+                } else {
+                    Err(HealthcheckError::NoLogGroup.into())
+                }
+            }
         },
-        Err(source) => Err(HealthcheckError::DescribeLogStreamsFailed { source }.into()),
+        Err(source) => Err(HealthcheckError::DescribeLogGroupsFailed { source }.into()),
     }
 }
 
@@ -688,9 +699,8 @@ mod tests {
         let group = "group".try_into().unwrap();
         let encoding = Encoding::Text.into();
 
-        let (_event, key) = partition_encode(event, &encoding, &group, &stream)
-            .unwrap()
-            .into_parts();
+        let encoded = partition_encode(event, &encoding, &group, &stream).unwrap();
+        let (_event, key) = encoded.item.into_parts();
 
         let expected = CloudwatchKey {
             stream: "stream".into(),
@@ -710,9 +720,8 @@ mod tests {
         let group = "group".try_into().unwrap();
         let encoding = Encoding::Text.into();
 
-        let (_event, key) = partition_encode(event, &encoding, &group, &stream)
-            .unwrap()
-            .into_parts();
+        let encoded = partition_encode(event, &encoding, &group, &stream).unwrap();
+        let (_event, key) = encoded.item.into_parts();
 
         let expected = CloudwatchKey {
             stream: "stream".into(),
@@ -732,9 +741,8 @@ mod tests {
         let group = "group".try_into().unwrap();
         let encoding = Encoding::Text.into();
 
-        let (_event, key) = partition_encode(event, &encoding, &group, &stream)
-            .unwrap()
-            .into_parts();
+        let encoded = partition_encode(event, &encoding, &group, &stream).unwrap();
+        let (_event, key) = encoded.item.into_parts();
 
         let expected = CloudwatchKey {
             stream: "abcd-stream".into(),
@@ -754,9 +762,8 @@ mod tests {
         let group = "group".try_into().unwrap();
         let encoding = Encoding::Text.into();
 
-        let (_event, key) = partition_encode(event, &encoding, &group, &stream)
-            .unwrap()
-            .into_parts();
+        let encoded = partition_encode(event, &encoding, &group, &stream).unwrap();
+        let (_event, key) = encoded.item.into_parts();
 
         let expected = CloudwatchKey {
             stream: "stream-abcd".into(),
@@ -884,13 +891,14 @@ mod integration_tests {
             batch: Default::default(),
             request: Default::default(),
             assume_role: None,
+            auth: Default::default(),
         };
 
         let (sink, _) = config.build(SinkContext::new_test()).await.unwrap();
 
         let timestamp = chrono::Utc::now();
 
-        let (input_lines, events) = random_lines_with_stream(100, 11);
+        let (input_lines, events) = random_lines_with_stream(100, 11, None);
         sink.run(events).await.unwrap();
 
         let request = GetLogEventsRequest {
@@ -930,13 +938,14 @@ mod integration_tests {
             batch: Default::default(),
             request: Default::default(),
             assume_role: None,
+            auth: Default::default(),
         };
 
         let (sink, _) = config.build(SinkContext::new_test()).await.unwrap();
 
         let timestamp = chrono::Utc::now() - chrono::Duration::days(1);
 
-        let (mut input_lines, events) = random_lines_with_stream(100, 11);
+        let (mut input_lines, events) = random_lines_with_stream(100, 11, None);
 
         // add a historical timestamp to all but the first event, to simulate
         // out-of-order timestamps.
@@ -995,6 +1004,7 @@ mod integration_tests {
             batch: Default::default(),
             request: Default::default(),
             assume_role: None,
+            auth: Default::default(),
         };
 
         let (sink, _) = config.build(SinkContext::new_test()).await.unwrap();
@@ -1066,13 +1076,14 @@ mod integration_tests {
             batch: Default::default(),
             request: Default::default(),
             assume_role: None,
+            auth: Default::default(),
         };
 
         let (sink, _) = config.build(SinkContext::new_test()).await.unwrap();
 
         let timestamp = chrono::Utc::now();
 
-        let (input_lines, events) = random_lines_with_stream(100, 11);
+        let (input_lines, events) = random_lines_with_stream(100, 11, None);
         sink.run(events).await.unwrap();
 
         let request = GetLogEventsRequest {
@@ -1117,13 +1128,14 @@ mod integration_tests {
             },
             request: Default::default(),
             assume_role: None,
+            auth: Default::default(),
         };
 
         let (sink, _) = config.build(SinkContext::new_test()).await.unwrap();
 
         let timestamp = chrono::Utc::now();
 
-        let (input_lines, events) = random_lines_with_stream(100, 11);
+        let (input_lines, events) = random_lines_with_stream(100, 11, None);
         let mut events = events.map(Ok);
         let _ = sink.into_sink().send_all(&mut events).await.unwrap();
 
@@ -1164,13 +1176,14 @@ mod integration_tests {
             batch: Default::default(),
             request: Default::default(),
             assume_role: None,
+            auth: Default::default(),
         };
 
         let (sink, _) = config.build(SinkContext::new_test()).await.unwrap();
 
         let timestamp = chrono::Utc::now();
 
-        let (input_lines, _events) = random_lines_with_stream(100, 10);
+        let (input_lines, _events) = random_lines_with_stream(100, 10, None);
 
         let events = input_lines
             .clone()
@@ -1249,6 +1262,7 @@ mod integration_tests {
             batch: Default::default(),
             request: Default::default(),
             assume_role: None,
+            auth: Default::default(),
         };
 
         let client = config.create_client().unwrap();

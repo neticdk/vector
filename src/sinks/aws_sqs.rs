@@ -1,15 +1,15 @@
 use crate::{
     config::{log_schema, DataType, GenerateConfig, SinkConfig, SinkContext, SinkDescription},
-    internal_events::{AwsSqsEventSent, AwsSqsMessageGroupIdMissingKeys},
-    rusoto,
+    event::Event,
+    internal_events::{AwsSqsEventSent, TemplateRenderingFailed},
+    rusoto::{self, AwsAuthentication, RegionOrEndpoint},
     sinks::util::{
         encoding::{EncodingConfig, EncodingConfiguration},
         retries::RetryLogic,
         sink::Response,
-        BatchSettings, EncodedLength, TowerRequestConfig, VecBuffer,
+        BatchSettings, EncodedEvent, EncodedLength, TowerRequestConfig, VecBuffer,
     },
-    template::{Template, TemplateError},
-    Event,
+    template::{Template, TemplateParseError},
 };
 use futures::{future::BoxFuture, stream, FutureExt, Sink, SinkExt, StreamExt, TryFutureExt};
 use lazy_static::lazy_static;
@@ -34,7 +34,7 @@ enum BuildError {
     #[snafu(display("`message_group_id` is not allowed with non-FIFO queue."))]
     MessageGroupIdNotAllowed,
     #[snafu(display("invalid topic template: {}", source))]
-    TopicTemplate { source: TemplateError },
+    TopicTemplate { source: TemplateParseError },
 }
 
 #[derive(Debug, Snafu)]
@@ -56,12 +56,15 @@ pub struct SqsSink {
 pub struct SqsSinkConfig {
     pub queue_url: String,
     #[serde(flatten)]
-    pub region: rusoto::RegionOrEndpoint,
+    pub region: RegionOrEndpoint,
     pub encoding: EncodingConfig<Encoding>,
     pub message_group_id: Option<String>,
     #[serde(default)]
     pub request: TowerRequestConfig,
-    pub assume_role: Option<String>,
+    // Deprecated name. Moved to auth.
+    assume_role: Option<String>,
+    #[serde(default)]
+    pub auth: AwsAuthentication,
 }
 
 lazy_static! {
@@ -132,7 +135,7 @@ impl SqsSinkConfig {
         let region = (&self.region).try_into()?;
         let client = rusoto::client()?;
 
-        let creds = rusoto::AwsCredentialsProvider::new(&region, self.assume_role.clone())?;
+        let creds = self.auth.build(&region, self.assume_role.clone())?;
 
         Ok(SqsClient::new_with(client, creds, region))
     }
@@ -249,15 +252,17 @@ fn encode_event(
     mut event: Event,
     encoding: &EncodingConfig<Encoding>,
     message_group_id: Option<&Template>,
-) -> Option<SendMessageEntry> {
+) -> Option<EncodedEvent<SendMessageEntry>> {
     encoding.apply_rules(&mut event);
 
     let message_group_id = match message_group_id {
         Some(tpl) => match tpl.render_string(&event) {
             Ok(value) => Some(value),
-            Err(missing_keys) => {
-                emit!(AwsSqsMessageGroupIdMissingKeys {
-                    keys: &missing_keys
+            Err(error) => {
+                emit!(TemplateRenderingFailed {
+                    error,
+                    field: Some("message_group_id"),
+                    drop_event: true
                 });
                 return None;
             }
@@ -274,10 +279,10 @@ fn encode_event(
         Encoding::Json => serde_json::to_string(&log).expect("Error encoding event as json."),
     };
 
-    Some(SendMessageEntry {
+    Some(EncodedEvent::new(SendMessageEntry {
         message_body,
         message_group_id,
-    })
+    }))
 }
 
 #[cfg(test)]
@@ -290,7 +295,7 @@ mod tests {
         let message = "hello world".to_string();
         let event = encode_event(message.clone().into(), &Encoding::Text.into(), None).unwrap();
 
-        assert_eq!(&event.message_body, &message);
+        assert_eq!(&event.item.message_body, &message);
     }
 
     #[test]
@@ -300,7 +305,7 @@ mod tests {
         event.as_mut_log().insert("key", "value");
         let event = encode_event(event, &Encoding::Json.into(), None).unwrap();
 
-        let map: BTreeMap<String, String> = serde_json::from_str(&event.message_body).unwrap();
+        let map: BTreeMap<String, String> = serde_json::from_str(&event.item.message_body).unwrap();
 
         assert_eq!(map[&log_schema().message_key().to_string()], message);
         assert_eq!(map["key"], "value".to_string());
@@ -315,7 +320,7 @@ mod integration_tests {
     use rusoto_core::Region;
     use rusoto_sqs::{CreateQueueRequest, GetQueueUrlRequest, ReceiveMessageRequest};
     use std::collections::HashMap;
-    use tokio::time::{delay_for, Duration};
+    use tokio::time::{sleep, Duration};
 
     #[tokio::test]
     async fn sqs_send_message_batch() {
@@ -334,21 +339,22 @@ mod integration_tests {
 
         let config = SqsSinkConfig {
             queue_url: queue_url.clone(),
-            region: rusoto::RegionOrEndpoint::with_endpoint("http://localhost:4566".into()),
+            region: RegionOrEndpoint::with_endpoint("http://localhost:4566".into()),
             encoding: Encoding::Text.into(),
             message_group_id: None,
             request: Default::default(),
             assume_role: None,
+            auth: Default::default(),
         };
 
         config.clone().healthcheck(client.clone()).await.unwrap();
 
         let mut sink = SqsSink::new(config, cx, client.clone()).unwrap();
 
-        let (mut input_lines, events) = random_lines_with_stream(100, 10);
+        let (mut input_lines, events) = random_lines_with_stream(100, 10, None);
         sink.send_all(&mut events.map(Ok)).await.unwrap();
 
-        delay_for(Duration::from_secs(1)).await;
+        sleep(Duration::from_secs(1)).await;
 
         let response = client
             .receive_message(ReceiveMessageRequest {

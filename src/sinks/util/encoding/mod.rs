@@ -35,11 +35,11 @@ mod with_default;
 pub use with_default::EncodingConfigWithDefault;
 
 use crate::{
-    event::{PathComponent, PathIter, Value},
-    Event, Result,
+    event::{Event, PathComponent, PathIter, Value},
+    Result,
 };
 use serde::{Deserialize, Serialize};
-use std::{collections::VecDeque, fmt::Debug};
+use std::fmt::Debug;
 
 /// The behavior of a encoding configuration.
 pub trait EncodingConfiguration<E> {
@@ -56,7 +56,7 @@ pub trait EncodingConfiguration<E> {
         if let Some(only_fields) = &self.only_fields() {
             match event {
                 Event::Log(log_event) => {
-                    let to_remove = log_event
+                    let mut to_remove = log_event
                         .keys()
                         .filter(|field| {
                             let field_path = PathIter::new(field).collect::<Vec<_>>();
@@ -65,9 +65,15 @@ pub trait EncodingConfiguration<E> {
                                 field_path.starts_with(&only[..])
                             })
                         })
-                        .collect::<VecDeque<_>>();
+                        .collect::<Vec<_>>();
+
+                    // reverse sort so that we delete array elements at the end first rather than
+                    // the start so that any `nulls` at the end are dropped and empty arrays are
+                    // pruned
+                    to_remove.sort_by(|a, b| b.cmp(a));
+
                     for removal in to_remove {
-                        log_event.remove(removal);
+                        log_event.remove_prune(removal, true);
                     }
                 }
                 Event::Metric(_) => {
@@ -106,7 +112,7 @@ pub trait EncodingConfiguration<E> {
                             }
                         }
                         // RFC3339 is the default serialization of a timestamp.
-                        TimestampFormat::RFC3339 => (),
+                        TimestampFormat::Rfc3339 => (),
                     }
                 }
                 Event::Metric(_) => (), // Metrics don't get affected by this one!
@@ -150,13 +156,14 @@ pub trait EncodingConfiguration<E> {
 #[serde(rename_all = "lowercase")]
 pub enum TimestampFormat {
     Unix,
-    RFC3339,
+    Rfc3339,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::log_schema;
+    use indoc::indoc;
 
     #[derive(Deserialize, Serialize, Debug, Eq, PartialEq, Clone)]
     enum TestEncoding {
@@ -174,9 +181,7 @@ mod tests {
         PathIter::new(a).collect()
     }
 
-    const TOML_SIMPLE_STRING: &str = r#"
-        encoding = "Snoot"
-    "#;
+    const TOML_SIMPLE_STRING: &str = r#"encoding = "Snoot""#;
     #[test]
     fn config_string() {
         let config: TestConfig = toml::from_str(TOML_SIMPLE_STRING).unwrap();
@@ -184,11 +189,11 @@ mod tests {
         assert_eq!(config.encoding.codec(), &TestEncoding::Snoot);
     }
 
-    const TOML_SIMPLE_STRUCT: &str = r#"
+    const TOML_SIMPLE_STRUCT: &str = indoc! {r#"
         encoding.codec = "Snoot"
         encoding.except_fields = ["Doop"]
         encoding.only_fields = ["Boop"]
-    "#;
+    "#};
     #[test]
     fn config_struct() {
         let config: TestConfig = toml::from_str(TOML_SIMPLE_STRUCT).unwrap();
@@ -201,21 +206,21 @@ mod tests {
         );
     }
 
-    const TOML_EXCLUSIVITY_VIOLATION: &str = r#"
+    const TOML_EXCLUSIVITY_VIOLATION: &str = indoc! {r#"
         encoding.codec = "Snoot"
         encoding.except_fields = ["Doop"]
         encoding.only_fields = ["Doop"]
-    "#;
+    "#};
     #[test]
     fn exclusivity_violation() {
         let config: std::result::Result<TestConfig, _> = toml::from_str(TOML_EXCLUSIVITY_VIOLATION);
         assert!(config.is_err())
     }
 
-    const TOML_EXCEPT_FIELD: &str = r#"
+    const TOML_EXCEPT_FIELD: &str = indoc! {r#"
         encoding.codec = "Snoot"
         encoding.except_fields = ["a.b.c", "b", "c[0].y"]
-    "#;
+    "#};
     #[test]
     fn test_except() {
         let config: TestConfig = toml::from_str(TOML_EXCEPT_FIELD).unwrap();
@@ -242,10 +247,10 @@ mod tests {
         assert!(event.as_mut_log().contains("c[0].x"));
     }
 
-    const TOML_ONLY_FIELD: &str = r#"
+    const TOML_ONLY_FIELD: &str = indoc! {r#"
         encoding.codec = "Snoot"
         encoding.only_fields = ["a.b.c", "b", "c[0].y"]
-    "#;
+    "#};
     #[test]
     fn test_only() {
         let config: TestConfig = toml::from_str(TOML_ONLY_FIELD).unwrap();
@@ -261,6 +266,10 @@ mod tests {
             log.insert("b[1].x", 1);
             log.insert("c[0].x", 1);
             log.insert("c[0].y", 1);
+            log.insert("d.y", 1);
+            log.insert("d.z", 1);
+            log.insert("e[0]", 1);
+            log.insert("e[1]", 1);
         }
         config.encoding.apply_rules(&mut event);
         assert!(event.as_mut_log().contains("a.b.c"));
@@ -270,12 +279,14 @@ mod tests {
 
         assert!(!event.as_mut_log().contains("a.b.d"));
         assert!(!event.as_mut_log().contains("c[0].x"));
+        assert!(!event.as_mut_log().contains("d"));
+        assert!(!event.as_mut_log().contains("e"));
     }
 
-    const TOML_TIMESTAMP_FORMAT: &str = r#"
+    const TOML_TIMESTAMP_FORMAT: &str = indoc! {r#"
         encoding.codec = "Snoot"
         encoding.timestamp_format = "unix"
-    "#;
+    "#};
     #[test]
     fn test_timestamp() {
         let config: TestConfig = toml::from_str(TOML_TIMESTAMP_FORMAT).unwrap();

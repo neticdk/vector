@@ -2,19 +2,22 @@ use crate::{
     buffers::Acker,
     config::{DataType, GenerateConfig, SinkConfig, SinkContext, SinkDescription},
     emit,
+    event::Event,
     internal_events::BlackholeEventReceived,
     sinks::util::StreamSink,
-    Event,
 };
 use async_trait::async_trait;
 use futures::{future, stream::BoxStream, FutureExt, StreamExt};
 use serde::{Deserialize, Serialize};
+use std::time::{Duration, Instant};
+use tokio::time::sleep_until;
 
 pub struct BlackholeSink {
     total_events: usize,
     total_raw_bytes: usize,
     config: BlackholeConfig,
     acker: Acker,
+    last: Option<Instant>,
 }
 
 #[derive(Clone, Debug, Derivative, Deserialize, Serialize)]
@@ -24,10 +27,11 @@ pub struct BlackholeConfig {
     #[derivative(Default(value = "1000"))]
     #[serde(default = "default_print_amount")]
     pub print_amount: usize,
+    pub rate: Option<usize>,
 }
 
 fn default_print_amount() -> usize {
-    1000
+    1_000
 }
 
 inventory::submit! {
@@ -69,6 +73,7 @@ impl BlackholeSink {
             total_events: 0,
             total_raw_bytes: 0,
             acker,
+            last: None,
         }
     }
 }
@@ -77,6 +82,13 @@ impl BlackholeSink {
 impl StreamSink for BlackholeSink {
     async fn run(&mut self, mut input: BoxStream<'_, Event>) -> Result<(), ()> {
         while let Some(event) = input.next().await {
+            if let Some(rate) = self.config.rate {
+                let until = self.last.unwrap_or_else(Instant::now)
+                    + Duration::from_secs_f32(1.0 / rate as f32);
+                sleep_until(until.into()).await;
+                self.last = Some(until);
+            }
+
             let message_len = match event {
                 Event::Log(log) => serde_json::to_string(&log),
                 Event::Metric(metric) => serde_json::to_string(&metric),
@@ -116,10 +128,13 @@ mod tests {
 
     #[tokio::test]
     async fn blackhole() {
-        let config = BlackholeConfig { print_amount: 10 };
+        let config = BlackholeConfig {
+            print_amount: 10,
+            rate: None,
+        };
         let mut sink = BlackholeSink::new(config, Acker::Null);
 
-        let (_input_lines, events) = random_events_with_stream(100, 10);
+        let (_input_lines, events) = random_events_with_stream(100, 10, None);
         let _ = sink.run(Box::pin(events)).await.unwrap();
     }
 }

@@ -7,7 +7,8 @@ use crate::{
         util::{
             encoding::{EncodingConfigWithDefault, EncodingConfiguration},
             http::{BatchedHttpSink, HttpSink},
-            BatchConfig, BatchSettings, BoxedRawValue, JsonArrayBuffer, TowerRequestConfig,
+            BatchConfig, BatchSettings, BoxedRawValue, EncodedEvent, JsonArrayBuffer,
+            TowerRequestConfig,
         },
         Healthcheck, VectorSink,
     },
@@ -157,7 +158,7 @@ impl HttpSink for StackdriverSink {
     type Input = serde_json::Value;
     type Output = Vec<BoxedRawValue>;
 
-    fn encode_event(&self, event: Event) -> Option<Self::Input> {
+    fn encode_event(&self, event: Event) -> Option<EncodedEvent<Self::Input>> {
         let mut log = event.into_log();
         let severity = self
             .severity_key
@@ -180,7 +181,7 @@ impl HttpSink for StackdriverSink {
             entry.insert("timestamp".into(), json!(timestamp));
         }
 
-        Some(json!(entry))
+        Some(EncodedEvent::new(json!(entry)).with_metadata(log))
     }
 
     async fn build_request(&self, events: Self::Output) -> crate::Result<Request<Vec<u8>>> {
@@ -272,6 +273,7 @@ mod tests {
     use super::*;
     use crate::event::{LogEvent, Value};
     use chrono::{TimeZone, Utc};
+    use indoc::indoc;
     use serde_json::value::RawValue;
     use std::iter::FromIterator;
 
@@ -282,15 +284,13 @@ mod tests {
 
     #[test]
     fn encode_valid() {
-        let config: StackdriverConfig = toml::from_str(
-            r#"
-           project_id = "project"
-           log_id = "testlogs"
-           resource.type = "generic_node"
-           resource.namespace = "office"
-           encoding.except_fields = ["anumber"]
-        "#,
-        )
+        let config: StackdriverConfig = toml::from_str(indoc! {r#"
+            project_id = "project"
+            log_id = "testlogs"
+            resource.type = "generic_node"
+            resource.namespace = "office"
+            encoding.except_fields = ["anumber"]
+        "#})
         .unwrap();
 
         let sink = StackdriverSink {
@@ -304,7 +304,7 @@ mod tests {
                 .iter()
                 .copied(),
         );
-        let json = sink.encode_event(Event::from(log)).unwrap();
+        let json = sink.encode_event(Event::from(log)).unwrap().item;
         let body = serde_json::to_string(&json).unwrap();
         assert_eq!(
             body,
@@ -314,14 +314,12 @@ mod tests {
 
     #[test]
     fn encode_inserts_timestamp() {
-        let config: StackdriverConfig = toml::from_str(
-            r#"
-           project_id = "project"
-           log_id = "testlogs"
-           resource.type = "generic_node"
-           resource.namespace = "office"
-        "#,
-        )
+        let config: StackdriverConfig = toml::from_str(indoc! {r#"
+            project_id = "project"
+            log_id = "testlogs"
+            resource.type = "generic_node"
+            resource.namespace = "office"
+        "#})
         .unwrap();
 
         let sink = StackdriverSink {
@@ -338,7 +336,7 @@ mod tests {
             Value::Timestamp(Utc.ymd(2020, 1, 1).and_hms(12, 30, 0)),
         );
 
-        let json = sink.encode_event(Event::from(log)).unwrap();
+        let json = sink.encode_event(Event::from(log)).unwrap().item;
         let body = serde_json::to_string(&json).unwrap();
         assert_eq!(
             body,
@@ -376,14 +374,12 @@ mod tests {
 
     #[tokio::test]
     async fn correct_request() {
-        let config: StackdriverConfig = toml::from_str(
-            r#"
-           project_id = "project"
-           log_id = "testlogs"
-           resource.type = "generic_node"
-           resource.namespace = "office"
-        "#,
-        )
+        let config: StackdriverConfig = toml::from_str(indoc! {r#"
+            project_id = "project"
+            log_id = "testlogs"
+            resource.type = "generic_node"
+            resource.namespace = "office"
+        "#})
         .unwrap();
 
         let sink = StackdriverSink {
@@ -394,8 +390,8 @@ mod tests {
 
         let log1 = LogEvent::from_iter([("message", "hello")].iter().copied());
         let log2 = LogEvent::from_iter([("message", "world")].iter().copied());
-        let event1 = sink.encode_event(Event::from(log1)).unwrap();
-        let event2 = sink.encode_event(Event::from(log2)).unwrap();
+        let event1 = sink.encode_event(Event::from(log1)).unwrap().item;
+        let event2 = sink.encode_event(Event::from(log2)).unwrap().item;
 
         let json1 = serde_json::to_string(&event1).unwrap();
         let json2 = serde_json::to_string(&event2).unwrap();
@@ -444,14 +440,12 @@ mod tests {
 
     #[tokio::test]
     async fn fails_missing_creds() {
-        let config: StackdriverConfig = toml::from_str(
-            r#"
-           project_id = "project"
-           log_id = "testlogs"
-           resource.type = "generic_node"
-           resource.namespace = "office"
-        "#,
-        )
+        let config: StackdriverConfig = toml::from_str(indoc! {r#"
+            project_id = "project"
+            log_id = "testlogs"
+            resource.type = "generic_node"
+            resource.namespace = "office"
+        "#})
         .unwrap();
         if config.build(SinkContext::new_test()).await.is_ok() {
             panic!("config.build failed to error");
@@ -460,24 +454,20 @@ mod tests {
 
     #[test]
     fn fails_invalid_log_names() {
-        toml::from_str::<StackdriverConfig>(
-            r#"
-           log_id = "testlogs"
-           resource.type = "generic_node"
-           resource.namespace = "office"
-        "#,
-        )
+        toml::from_str::<StackdriverConfig>(indoc! {r#"
+            log_id = "testlogs"
+            resource.type = "generic_node"
+            resource.namespace = "office"
+        "#})
         .expect_err("Config parsing failed to error with missing ids");
 
-        toml::from_str::<StackdriverConfig>(
-            r#"
-           project_id = "project"
-           folder_id = "folder"
-           log_id = "testlogs"
-           resource.type = "generic_node"
-           resource.namespace = "office"
-        "#,
-        )
+        toml::from_str::<StackdriverConfig>(indoc! {r#"
+            project_id = "project"
+            folder_id = "folder"
+            log_id = "testlogs"
+            resource.type = "generic_node"
+            resource.namespace = "office"
+        "#})
         .expect_err("Config parsing failed to error with extraneous ids");
     }
 }
