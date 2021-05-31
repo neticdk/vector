@@ -1,5 +1,5 @@
 use super::InternalEvent;
-use crate::config;
+use crate::{built_info, config};
 use metrics::counter;
 use std::path::PathBuf;
 
@@ -12,9 +12,8 @@ impl InternalEvent for VectorStarted {
             target: "vector",
             message = "Vector has started.",
             version = built_info::PKG_VERSION,
-            git_version = built_info::GIT_VERSION.unwrap_or(""),
-            released = built_info::BUILT_TIME_UTC,
-            arch = built_info::CFG_TARGET_ARCH
+            arch = built_info::TARGET_ARCH,
+            build_id = built_info::VECTOR_BUILD_DESC.unwrap_or("none"),
         );
     }
 
@@ -120,9 +119,4 @@ impl InternalEvent for VectorRecoveryFailed {
     fn emit_metrics(&self) {
         counter!("recover_errors_total", 1);
     }
-}
-
-#[allow(unused)]
-mod built_info {
-    include!(concat!(env!("OUT_DIR"), "/built.rs"));
 }

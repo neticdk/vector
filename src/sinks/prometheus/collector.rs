@@ -1,9 +1,10 @@
 use crate::{
-    event::metric::{Metric, MetricValue, StatisticKind},
-    prometheus::{proto, METRIC_NAME_LABEL},
+    event::metric::{Metric, MetricKind, MetricValue, StatisticKind},
     sinks::util::{encode_namespace, statistic::DistributionStatistic},
 };
+use chrono::Utc;
 use indexmap::map::IndexMap;
+use prometheus_parser::{proto, METRIC_NAME_LABEL};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
@@ -20,7 +21,7 @@ pub(super) trait MetricCollector {
         name: &str,
         suffix: &str,
         value: f64,
-        tags: &Option<BTreeMap<String, String>>,
+        tags: Option<&BTreeMap<String, String>>,
         extra: Option<(&str, String)>,
     );
 
@@ -34,19 +35,15 @@ pub(super) trait MetricCollector {
         expired: bool,
         metric: &Metric,
     ) {
-        let name = encode_namespace(
-            metric.namespace.as_deref().or(default_namespace),
-            '_',
-            &metric.name,
-        );
+        let name = encode_namespace(metric.namespace().or(default_namespace), '_', metric.name());
         let name = &name;
-        let timestamp = metric.timestamp.map(|t| t.timestamp_millis());
+        let timestamp = metric.data.timestamp.map(|t| t.timestamp_millis());
 
-        if metric.kind.is_absolute() {
-            let tags = &metric.tags;
-            self.emit_metadata(&metric.name, &name, &metric.value);
+        if metric.data.kind == MetricKind::Absolute {
+            let tags = metric.tags();
+            self.emit_metadata(metric.name(), &name, &metric.data.value);
 
-            match &metric.value {
+            match &metric.data.value {
                 MetricValue::Counter { value } => {
                     self.emit_value(timestamp, &name, "", *value, tags, None);
                 }
@@ -59,25 +56,24 @@ pub(super) trait MetricCollector {
                     self.emit_value(timestamp, &name, "", value as f64, tags, None);
                 }
                 MetricValue::Distribution {
-                    values,
-                    sample_rates,
+                    samples,
                     statistic: StatisticKind::Histogram,
                 } => {
                     // convert distributions into aggregated histograms
                     let mut counts = vec![0; buckets.len()];
                     let mut sum = 0.0;
                     let mut count = 0;
-                    for (v, c) in values.iter().zip(sample_rates.iter()) {
+                    for sample in samples {
                         buckets
                             .iter()
                             .enumerate()
-                            .skip_while(|&(_, b)| b < v)
+                            .skip_while(|&(_, b)| *b < sample.value)
                             .for_each(|(i, _)| {
-                                counts[i] += c;
+                                counts[i] += sample.rate;
                             });
 
-                        sum += v * (*c as f64);
-                        count += c;
+                        sum += sample.value * (sample.rate as f64);
+                        count += sample.rate;
                     }
 
                     for (b, c) in buckets.iter().zip(counts.iter()) {
@@ -102,12 +98,10 @@ pub(super) trait MetricCollector {
                     self.emit_value(timestamp, &name, "_count", count as f64, tags, None);
                 }
                 MetricValue::Distribution {
-                    values,
-                    sample_rates,
+                    samples,
                     statistic: StatisticKind::Summary,
                 } => {
-                    if let Some(statistic) =
-                        DistributionStatistic::new(values, sample_rates, quantiles)
+                    if let Some(statistic) = DistributionStatistic::from_samples(samples, quantiles)
                     {
                         for (q, v) in statistic.quantiles.iter() {
                             self.emit_value(
@@ -138,22 +132,21 @@ pub(super) trait MetricCollector {
                 }
                 MetricValue::AggregatedHistogram {
                     buckets,
-                    counts,
                     count,
                     sum,
                 } => {
                     let mut value = 0f64;
-                    for (b, c) in buckets.iter().zip(counts.iter()) {
+                    for bucket in buckets {
                         // prometheus uses cumulative histogram
                         // https://prometheus.io/docs/concepts/metric_types/#histogram
-                        value += *c as f64;
+                        value += bucket.count as f64;
                         self.emit_value(
                             timestamp,
                             &name,
                             "_bucket",
                             value,
                             tags,
-                            Some(("le", b.to_string())),
+                            Some(("le", bucket.upper_limit.to_string())),
                         );
                     }
                     self.emit_value(
@@ -169,18 +162,17 @@ pub(super) trait MetricCollector {
                 }
                 MetricValue::AggregatedSummary {
                     quantiles,
-                    values,
                     count,
                     sum,
                 } => {
-                    for (q, v) in quantiles.iter().zip(values.iter()) {
+                    for quantile in quantiles {
                         self.emit_value(
                             timestamp,
                             &name,
                             "",
-                            *v,
+                            quantile.value,
                             tags,
-                            Some(("quantile", q.to_string())),
+                            Some(("quantile", quantile.upper_limit.to_string())),
                         );
                     }
                     self.emit_value(timestamp, &name, "_sum", *sum, tags, None);
@@ -217,7 +209,7 @@ impl MetricCollector for StringCollector {
         name: &str,
         suffix: &str,
         value: f64,
-        tags: &Option<BTreeMap<String, String>>,
+        tags: Option<&BTreeMap<String, String>>,
         extra: Option<(&str, String)>,
     ) {
         let result = self
@@ -242,7 +234,7 @@ impl MetricCollector for StringCollector {
 impl StringCollector {
     fn encode_tags(
         result: &mut String,
-        tags: &Option<BTreeMap<String, String>>,
+        tags: Option<&BTreeMap<String, String>>,
         extra: Option<(&str, String)>,
     ) {
         match (tags, extra) {
@@ -266,7 +258,7 @@ impl StringCollector {
     }
 
     fn encode_header(name: &str, fullname: &str, value: &MetricValue) -> String {
-        let r#type = value.prometheus_metric_type().as_str();
+        let r#type = prometheus_metric_type(value).as_str();
         format!(
             "# HELP {} {}\n# TYPE {} {}\n",
             fullname, name, fullname, r#type
@@ -279,11 +271,12 @@ type Labels = Vec<proto::Label>;
 pub(super) struct TimeSeries {
     buffer: IndexMap<Labels, Vec<proto::Sample>>,
     metadata: IndexMap<String, proto::MetricMetadata>,
+    timestamp: Option<i64>,
 }
 
 impl TimeSeries {
     fn make_labels(
-        tags: &Option<BTreeMap<String, String>>,
+        tags: Option<&BTreeMap<String, String>>,
         name: &str,
         suffix: &str,
         extra: Option<(&str, String)>,
@@ -292,7 +285,7 @@ impl TimeSeries {
         // contains all the labels from the source metric, plus the name
         // label for the actual metric name. For convenience below, an
         // optional extra tag is added.
-        let mut labels = tags.clone().unwrap_or_default();
+        let mut labels = tags.cloned().unwrap_or_default();
         labels.insert(METRIC_NAME_LABEL.into(), [name, suffix].join(""));
         if let Some((name, value)) = extra {
             labels.insert(name.into(), value);
@@ -307,6 +300,12 @@ impl TimeSeries {
         labels.sort();
         labels
     }
+
+    fn default_timestamp(&mut self) -> i64 {
+        *self
+            .timestamp
+            .get_or_insert_with(|| Utc::now().timestamp_millis())
+    }
 }
 
 impl MetricCollector for TimeSeries {
@@ -316,12 +315,13 @@ impl MetricCollector for TimeSeries {
         Self {
             buffer: Default::default(),
             metadata: Default::default(),
+            timestamp: None,
         }
     }
 
     fn emit_metadata(&mut self, name: &str, fullname: &str, value: &MetricValue) {
         if !self.metadata.contains_key(name) {
-            let r#type = value.prometheus_metric_type();
+            let r#type = prometheus_metric_type(value);
             let metadata = proto::MetricMetadata {
                 r#type: r#type as i32,
                 metric_family_name: fullname.into(),
@@ -338,16 +338,14 @@ impl MetricCollector for TimeSeries {
         name: &str,
         suffix: &str,
         value: f64,
-        tags: &Option<BTreeMap<String, String>>,
+        tags: Option<&BTreeMap<String, String>>,
         extra: Option<(&str, String)>,
     ) {
+        let timestamp = timestamp_millis.unwrap_or_else(|| self.default_timestamp());
         self.buffer
             .entry(Self::make_labels(tags, name, suffix, extra))
             .or_default()
-            .push(proto::Sample {
-                value,
-                timestamp: timestamp_millis.unwrap_or(0),
-            });
+            .push(proto::Sample { value, timestamp });
     }
 
     fn finish(self) -> proto::WriteRequest {
@@ -368,23 +366,21 @@ impl MetricCollector for TimeSeries {
     }
 }
 
-impl MetricValue {
-    fn prometheus_metric_type(&self) -> proto::MetricType {
-        use proto::MetricType;
-        match self {
-            MetricValue::Counter { .. } => MetricType::Counter,
-            MetricValue::Gauge { .. } | MetricValue::Set { .. } => MetricType::Gauge,
-            MetricValue::Distribution {
-                statistic: StatisticKind::Histogram,
-                ..
-            } => MetricType::Histogram,
-            MetricValue::Distribution {
-                statistic: StatisticKind::Summary,
-                ..
-            } => MetricType::Summary,
-            MetricValue::AggregatedHistogram { .. } => MetricType::Histogram,
-            MetricValue::AggregatedSummary { .. } => MetricType::Summary,
-        }
+fn prometheus_metric_type(metric_value: &MetricValue) -> proto::MetricType {
+    use proto::MetricType;
+    match metric_value {
+        MetricValue::Counter { .. } => MetricType::Counter,
+        MetricValue::Gauge { .. } | MetricValue::Set { .. } => MetricType::Gauge,
+        MetricValue::Distribution {
+            statistic: StatisticKind::Histogram,
+            ..
+        } => MetricType::Histogram,
+        MetricValue::Distribution {
+            statistic: StatisticKind::Summary,
+            ..
+        } => MetricType::Summary,
+        MetricValue::AggregatedHistogram { .. } => MetricType::Histogram,
+        MetricValue::AggregatedSummary { .. } => MetricType::Summary,
     }
 }
 
@@ -393,6 +389,8 @@ mod tests {
     use super::super::default_summary_quantiles;
     use super::*;
     use crate::event::metric::{Metric, MetricKind, MetricValue, StatisticKind};
+    use chrono::{DateTime, TimeZone};
+    use indoc::indoc;
     use pretty_assertions::assert_eq;
 
     fn encode_one<T: MetricCollector>(
@@ -457,10 +455,11 @@ mod tests {
     fn encodes_counter_text() {
         assert_eq!(
             encode_counter::<StringCollector>(),
-            r#"# HELP vector_hits hits
-# TYPE vector_hits counter
-vector_hits{code="200"} 10
-"#
+            indoc! { r#"
+                # HELP vector_hits hits
+                # TYPE vector_hits counter
+                vector_hits{code="200"} 10 1612325106789
+            "#}
         );
     }
 
@@ -468,19 +467,18 @@ vector_hits{code="200"} 10
     fn encodes_counter_request() {
         assert_eq!(
             encode_counter::<TimeSeries>(),
-            write_request!("vector_hits", "hits", Counter ["" @ 0 = 10.0 ["code" => "200"]])
+            write_request!("vector_hits", "hits", Counter ["" @ 1612325106789 = 10.0 ["code" => "200"]])
         );
     }
 
     fn encode_counter<T: MetricCollector>() -> T::Output {
-        let metric = Metric {
-            name: "hits".to_owned(),
-            namespace: None,
-            timestamp: None,
-            tags: Some(tags()),
-            kind: MetricKind::Absolute,
-            value: MetricValue::Counter { value: 10.0 },
-        };
+        let metric = Metric::new(
+            "hits".to_owned(),
+            MetricKind::Absolute,
+            MetricValue::Counter { value: 10.0 },
+        )
+        .with_tags(Some(tags()))
+        .with_timestamp(Some(timestamp()));
         encode_one::<T>(Some("vector"), &[], &[], false, &metric)
     }
 
@@ -488,10 +486,11 @@ vector_hits{code="200"} 10
     fn encodes_gauge_text() {
         assert_eq!(
             encode_gauge::<StringCollector>(),
-            r#"# HELP vector_temperature temperature
-# TYPE vector_temperature gauge
-vector_temperature{code="200"} -1.1
-"#
+            indoc! { r#"
+                # HELP vector_temperature temperature
+                # TYPE vector_temperature gauge
+                vector_temperature{code="200"} -1.1 1612325106789
+            "#}
         );
     }
 
@@ -499,19 +498,18 @@ vector_temperature{code="200"} -1.1
     fn encodes_gauge_request() {
         assert_eq!(
             encode_gauge::<TimeSeries>(),
-            write_request!("vector_temperature", "temperature", Gauge ["" @ 0 = -1.1 ["code" => "200"]])
+            write_request!("vector_temperature", "temperature", Gauge ["" @ 1612325106789 = -1.1 ["code" => "200"]])
         );
     }
 
     fn encode_gauge<T: MetricCollector>() -> T::Output {
-        let metric = Metric {
-            name: "temperature".to_owned(),
-            namespace: None,
-            timestamp: None,
-            tags: Some(tags()),
-            kind: MetricKind::Absolute,
-            value: MetricValue::Gauge { value: -1.1 },
-        };
+        let metric = Metric::new(
+            "temperature".to_owned(),
+            MetricKind::Absolute,
+            MetricValue::Gauge { value: -1.1 },
+        )
+        .with_tags(Some(tags()))
+        .with_timestamp(Some(timestamp()));
         encode_one::<T>(Some("vector"), &[], &[], false, &metric)
     }
 
@@ -519,10 +517,11 @@ vector_temperature{code="200"} -1.1
     fn encodes_set_text() {
         assert_eq!(
             encode_set::<StringCollector>(),
-            r#"# HELP vector_users users
-# TYPE vector_users gauge
-vector_users 1
-"#
+            indoc! { r#"
+                # HELP vector_users users
+                # TYPE vector_users gauge
+                vector_users 1 1612325106789
+            "#}
         );
     }
 
@@ -530,21 +529,19 @@ vector_users 1
     fn encodes_set_request() {
         assert_eq!(
             encode_set::<TimeSeries>(),
-            write_request!("vector_users", "users", Gauge [ "" @ 0 = 1.0 []])
+            write_request!("vector_users", "users", Gauge [ "" @ 1612325106789 = 1.0 []])
         );
     }
 
     fn encode_set<T: MetricCollector>() -> T::Output {
-        let metric = Metric {
-            name: "users".to_owned(),
-            namespace: None,
-            timestamp: None,
-            tags: None,
-            kind: MetricKind::Absolute,
-            value: MetricValue::Set {
+        let metric = Metric::new(
+            "users".to_owned(),
+            MetricKind::Absolute,
+            MetricValue::Set {
                 values: vec!["foo".into()].into_iter().collect(),
             },
-        };
+        )
+        .with_timestamp(Some(timestamp()));
         encode_one::<T>(Some("vector"), &[], &[], false, &metric)
     }
 
@@ -552,10 +549,11 @@ vector_users 1
     fn encodes_expired_set_text() {
         assert_eq!(
             encode_expired_set::<StringCollector>(),
-            r#"# HELP vector_users users
-# TYPE vector_users gauge
-vector_users 0
-"#
+            indoc! {r#"
+                # HELP vector_users users
+                # TYPE vector_users gauge
+                vector_users 0 1612325106789
+            "#}
         );
     }
 
@@ -563,21 +561,19 @@ vector_users 0
     fn encodes_expired_set_request() {
         assert_eq!(
             encode_expired_set::<TimeSeries>(),
-            write_request!("vector_users", "users", Gauge ["" @ 0 = 0.0 []])
+            write_request!("vector_users", "users", Gauge ["" @ 1612325106789 = 0.0 []])
         );
     }
 
     fn encode_expired_set<T: MetricCollector>() -> T::Output {
-        let metric = Metric {
-            name: "users".to_owned(),
-            namespace: None,
-            timestamp: None,
-            tags: None,
-            kind: MetricKind::Absolute,
-            value: MetricValue::Set {
+        let metric = Metric::new(
+            "users".to_owned(),
+            MetricKind::Absolute,
+            MetricValue::Set {
                 values: vec!["foo".into()].into_iter().collect(),
             },
-        };
+        )
+        .with_timestamp(Some(timestamp()));
         encode_one::<T>(Some("vector"), &[], &[], true, &metric)
     }
 
@@ -585,15 +581,16 @@ vector_users 0
     fn encodes_distribution_text() {
         assert_eq!(
             encode_distribution::<StringCollector>(),
-            r#"# HELP vector_requests requests
-# TYPE vector_requests histogram
-vector_requests_bucket{le="0"} 0
-vector_requests_bucket{le="2.5"} 6
-vector_requests_bucket{le="5"} 8
-vector_requests_bucket{le="+Inf"} 8
-vector_requests_sum 15
-vector_requests_count 8
-"#
+            indoc! {r#"
+                # HELP vector_requests requests
+                # TYPE vector_requests histogram
+                vector_requests_bucket{le="0"} 0 1612325106789
+                vector_requests_bucket{le="2.5"} 6 1612325106789
+                vector_requests_bucket{le="5"} 8 1612325106789
+                vector_requests_bucket{le="+Inf"} 8 1612325106789
+                vector_requests_sum 15 1612325106789
+                vector_requests_count 8 1612325106789
+            "#}
         );
     }
 
@@ -603,30 +600,27 @@ vector_requests_count 8
             encode_distribution::<TimeSeries>(),
             write_request!(
                 "vector_requests", "requests", Histogram [
-                        "_bucket" @ 0 = 0.0 ["le" => "0"],
-                        "_bucket" @ 0 = 6.0 ["le" => "2.5"],
-                        "_bucket" @ 0 = 8.0 ["le" => "5"],
-                        "_bucket" @ 0 = 8.0 ["le" => "+Inf"],
-                        "_sum" @ 0 = 15.0 [],
-                        "_count" @ 0 = 8.0 []
+                        "_bucket" @ 1612325106789 = 0.0 ["le" => "0"],
+                        "_bucket" @ 1612325106789 = 6.0 ["le" => "2.5"],
+                        "_bucket" @ 1612325106789 = 8.0 ["le" => "5"],
+                        "_bucket" @ 1612325106789 = 8.0 ["le" => "+Inf"],
+                        "_sum" @ 1612325106789 = 15.0 [],
+                        "_count" @ 1612325106789 = 8.0 []
                 ]
             )
         );
     }
 
     fn encode_distribution<T: MetricCollector>() -> T::Output {
-        let metric = Metric {
-            name: "requests".to_owned(),
-            namespace: None,
-            timestamp: None,
-            tags: None,
-            kind: MetricKind::Absolute,
-            value: MetricValue::Distribution {
-                values: vec![1.0, 2.0, 3.0],
-                sample_rates: vec![3, 3, 2],
+        let metric = Metric::new(
+            "requests".to_owned(),
+            MetricKind::Absolute,
+            MetricValue::Distribution {
+                samples: vector_core::samples![1.0 => 3, 2.0 => 3, 3.0 => 2],
                 statistic: StatisticKind::Histogram,
             },
-        };
+        )
+        .with_timestamp(Some(timestamp()));
         encode_one::<T>(Some("vector"), &[0.0, 2.5, 5.0], &[], false, &metric)
     }
 
@@ -634,15 +628,16 @@ vector_requests_count 8
     fn encodes_histogram_text() {
         assert_eq!(
             encode_histogram::<StringCollector>(),
-            r#"# HELP vector_requests requests
-# TYPE vector_requests histogram
-vector_requests_bucket{le="1"} 1
-vector_requests_bucket{le="2.1"} 3
-vector_requests_bucket{le="3"} 6
-vector_requests_bucket{le="+Inf"} 6
-vector_requests_sum 12.5
-vector_requests_count 6
-"#
+            indoc! {r#"
+                # HELP vector_requests requests
+                # TYPE vector_requests histogram
+                vector_requests_bucket{le="1"} 1 1612325106789
+                vector_requests_bucket{le="2.1"} 3 1612325106789
+                vector_requests_bucket{le="3"} 6 1612325106789
+                vector_requests_bucket{le="+Inf"} 6 1612325106789
+                vector_requests_sum 12.5 1612325106789
+                vector_requests_count 6 1612325106789
+            "#}
         );
     }
 
@@ -652,31 +647,28 @@ vector_requests_count 6
             encode_histogram::<TimeSeries>(),
             write_request!(
                 "vector_requests", "requests", Histogram [
-                        "_bucket" @ 0 = 1.0 ["le" => "1"],
-                        "_bucket" @ 0 = 3.0 ["le" => "2.1"],
-                        "_bucket" @ 0 = 6.0 ["le" => "3"],
-                        "_bucket" @ 0 = 6.0 ["le" => "+Inf"],
-                        "_sum" @ 0 = 12.5 [],
-                        "_count" @ 0 = 6.0 []
+                        "_bucket" @ 1612325106789 = 1.0 ["le" => "1"],
+                        "_bucket" @ 1612325106789 = 3.0 ["le" => "2.1"],
+                        "_bucket" @ 1612325106789 = 6.0 ["le" => "3"],
+                        "_bucket" @ 1612325106789 = 6.0 ["le" => "+Inf"],
+                        "_sum" @ 1612325106789 = 12.5 [],
+                        "_count" @ 1612325106789 = 6.0 []
                     ]
             )
         );
     }
 
     fn encode_histogram<T: MetricCollector>() -> T::Output {
-        let metric = Metric {
-            name: "requests".to_owned(),
-            namespace: None,
-            timestamp: None,
-            tags: None,
-            kind: MetricKind::Absolute,
-            value: MetricValue::AggregatedHistogram {
-                buckets: vec![1.0, 2.1, 3.0],
-                counts: vec![1, 2, 3],
+        let metric = Metric::new(
+            "requests".to_owned(),
+            MetricKind::Absolute,
+            MetricValue::AggregatedHistogram {
+                buckets: vector_core::buckets![1.0 => 1, 2.1 => 2, 3.0 => 3],
                 count: 6,
                 sum: 12.5,
             },
-        };
+        )
+        .with_timestamp(Some(timestamp()));
         encode_one::<T>(Some("vector"), &[], &[], false, &metric)
     }
 
@@ -684,14 +676,14 @@ vector_requests_count 6
     fn encodes_summary_text() {
         assert_eq!(
             encode_summary::<StringCollector>(),
-            r#"# HELP ns_requests requests
-# TYPE ns_requests summary
-ns_requests{code="200",quantile="0.01"} 1.5
-ns_requests{code="200",quantile="0.5"} 2
-ns_requests{code="200",quantile="0.99"} 3
-ns_requests_sum{code="200"} 12
-ns_requests_count{code="200"} 6
-"#
+            indoc! {r#"# HELP ns_requests requests
+                # TYPE ns_requests summary
+                ns_requests{code="200",quantile="0.01"} 1.5 1612325106789
+                ns_requests{code="200",quantile="0.5"} 2 1612325106789
+                ns_requests{code="200",quantile="0.99"} 3 1612325106789
+                ns_requests_sum{code="200"} 12 1612325106789
+                ns_requests_count{code="200"} 6 1612325106789
+            "#}
         );
     }
 
@@ -701,30 +693,28 @@ ns_requests_count{code="200"} 6
             encode_summary::<TimeSeries>(),
             write_request!(
                 "ns_requests", "requests", Summary [
-                    "" @ 0 = 1.5 ["code" => "200", "quantile" => "0.01"],
-                    "" @ 0 = 2.0 ["code" => "200", "quantile" => "0.5"],
-                    "" @ 0 = 3.0 ["code" => "200", "quantile" => "0.99"],
-                    "_sum" @ 0 = 12.0 ["code" => "200"],
-                    "_count" @ 0 = 6.0 ["code" => "200"]
+                    "" @ 1612325106789 = 1.5 ["code" => "200", "quantile" => "0.01"],
+                    "" @ 1612325106789 = 2.0 ["code" => "200", "quantile" => "0.5"],
+                    "" @ 1612325106789 = 3.0 ["code" => "200", "quantile" => "0.99"],
+                    "_sum" @ 1612325106789 = 12.0 ["code" => "200"],
+                    "_count" @ 1612325106789 = 6.0 ["code" => "200"]
                 ]
             )
         );
     }
 
     fn encode_summary<T: MetricCollector>() -> T::Output {
-        let metric = Metric {
-            name: "requests".to_owned(),
-            namespace: None,
-            timestamp: None,
-            tags: Some(tags()),
-            kind: MetricKind::Absolute,
-            value: MetricValue::AggregatedSummary {
-                quantiles: vec![0.01, 0.5, 0.99],
-                values: vec![1.5, 2.0, 3.0],
+        let metric = Metric::new(
+            "requests".to_owned(),
+            MetricKind::Absolute,
+            MetricValue::AggregatedSummary {
+                quantiles: vector_core::quantiles![0.01 => 1.5, 0.5 => 2.0, 0.99 => 3.0],
                 count: 6,
                 sum: 12.0,
             },
-        };
+        )
+        .with_tags(Some(tags()))
+        .with_timestamp(Some(timestamp()));
         encode_one::<T>(Some("ns"), &[], &[], false, &metric)
     }
 
@@ -732,19 +722,20 @@ ns_requests_count{code="200"} 6
     fn encodes_distribution_summary_text() {
         assert_eq!(
             encode_distribution_summary::<StringCollector>(),
-            r#"# HELP ns_requests requests
-# TYPE ns_requests summary
-ns_requests{code="200",quantile="0.5"} 2
-ns_requests{code="200",quantile="0.75"} 2
-ns_requests{code="200",quantile="0.9"} 3
-ns_requests{code="200",quantile="0.95"} 3
-ns_requests{code="200",quantile="0.99"} 3
-ns_requests_sum{code="200"} 15
-ns_requests_count{code="200"} 8
-ns_requests_min{code="200"} 1
-ns_requests_max{code="200"} 3
-ns_requests_avg{code="200"} 1.875
-"#
+            indoc! {r#"
+                # HELP ns_requests requests
+                # TYPE ns_requests summary
+                ns_requests{code="200",quantile="0.5"} 2 1612325106789
+                ns_requests{code="200",quantile="0.75"} 2 1612325106789
+                ns_requests{code="200",quantile="0.9"} 3 1612325106789
+                ns_requests{code="200",quantile="0.95"} 3 1612325106789
+                ns_requests{code="200",quantile="0.99"} 3 1612325106789
+                ns_requests_sum{code="200"} 15 1612325106789
+                ns_requests_count{code="200"} 8 1612325106789
+                ns_requests_min{code="200"} 1 1612325106789
+                ns_requests_max{code="200"} 3 1612325106789
+                ns_requests_avg{code="200"} 1.875 1612325106789
+            "#}
         );
     }
 
@@ -754,34 +745,32 @@ ns_requests_avg{code="200"} 1.875
             encode_distribution_summary::<TimeSeries>(),
             write_request!(
                 "ns_requests", "requests", Summary [
-                    "" @ 0 = 2.0 ["code" => "200", "quantile" => "0.5"],
-                    "" @ 0 = 2.0 ["code" => "200", "quantile" => "0.75"],
-                    "" @ 0 = 3.0 ["code" => "200", "quantile" => "0.9"],
-                    "" @ 0 = 3.0 ["code" => "200", "quantile" => "0.95"],
-                    "" @ 0 = 3.0 ["code" => "200", "quantile" => "0.99"],
-                    "_sum" @ 0 = 15.0 ["code" => "200"],
-                    "_count" @ 0 = 8.0 ["code" => "200"],
-                    "_min" @ 0 = 1.0 ["code" => "200"],
-                    "_max" @ 0 = 3.0 ["code" => "200"],
-                    "_avg" @ 0 = 1.875 ["code" => "200"]
+                    "" @ 1612325106789 = 2.0 ["code" => "200", "quantile" => "0.5"],
+                    "" @ 1612325106789 = 2.0 ["code" => "200", "quantile" => "0.75"],
+                    "" @ 1612325106789 = 3.0 ["code" => "200", "quantile" => "0.9"],
+                    "" @ 1612325106789 = 3.0 ["code" => "200", "quantile" => "0.95"],
+                    "" @ 1612325106789 = 3.0 ["code" => "200", "quantile" => "0.99"],
+                    "_sum" @ 1612325106789 = 15.0 ["code" => "200"],
+                    "_count" @ 1612325106789 = 8.0 ["code" => "200"],
+                    "_min" @ 1612325106789 = 1.0 ["code" => "200"],
+                    "_max" @ 1612325106789 = 3.0 ["code" => "200"],
+                    "_avg" @ 1612325106789 = 1.875 ["code" => "200"]
                 ]
             )
         );
     }
 
     fn encode_distribution_summary<T: MetricCollector>() -> T::Output {
-        let metric = Metric {
-            name: "requests".to_owned(),
-            namespace: None,
-            timestamp: None,
-            tags: Some(tags()),
-            kind: MetricKind::Absolute,
-            value: MetricValue::Distribution {
-                values: vec![1.0, 2.0, 3.0],
-                sample_rates: vec![3, 3, 2],
+        let metric = Metric::new(
+            "requests".to_owned(),
+            MetricKind::Absolute,
+            MetricValue::Distribution {
+                samples: vector_core::samples![1.0 => 3, 2.0 => 3, 3.0 => 2],
                 statistic: StatisticKind::Summary,
             },
-        };
+        )
+        .with_tags(Some(tags()))
+        .with_timestamp(Some(timestamp()));
         encode_one::<T>(
             Some("ns"),
             &[],
@@ -795,10 +784,11 @@ ns_requests_avg{code="200"} 1.875
     fn encodes_timestamp_text() {
         assert_eq!(
             encode_timestamp::<StringCollector>(),
-            r#"# HELP temperature temperature
-# TYPE temperature counter
-temperature 2 1234567890123
-"#
+            indoc! {r#"
+                # HELP temperature temperature
+                # TYPE temperature counter
+                temperature 2 1612325106789
+            "#}
         );
     }
 
@@ -806,23 +796,33 @@ temperature 2 1234567890123
     fn encodes_timestamp_request() {
         assert_eq!(
             encode_timestamp::<TimeSeries>(),
-            write_request!("temperature", "temperature", Counter ["" @ 1234567890123 = 2.0 []])
+            write_request!("temperature", "temperature", Counter ["" @ 1612325106789 = 2.0 []])
         );
     }
 
     fn encode_timestamp<T: MetricCollector>() -> T::Output {
-        use chrono::{DateTime, NaiveDateTime, Utc};
-        let metric = Metric {
-            name: "temperature".to_owned(),
-            namespace: None,
-            timestamp: Some(DateTime::<Utc>::from_utc(
-                NaiveDateTime::from_timestamp(1234567890, 123456789),
-                Utc,
-            )),
-            tags: None,
-            kind: MetricKind::Absolute,
-            value: MetricValue::Counter { value: 2.0 },
-        };
+        let metric = Metric::new(
+            "temperature".to_owned(),
+            MetricKind::Absolute,
+            MetricValue::Counter { value: 2.0 },
+        )
+        .with_timestamp(Some(timestamp()));
         encode_one::<T>(None, &[], &[], false, &metric)
+    }
+
+    #[test]
+    fn adds_timestamp_request() {
+        let now = Utc::now().timestamp_millis();
+        let metric = Metric::new(
+            "something".to_owned(),
+            MetricKind::Absolute,
+            MetricValue::Gauge { value: 1.0 },
+        );
+        let encoded = encode_one::<TimeSeries>(None, &[], &[], false, &metric);
+        assert!(encoded.timeseries[0].samples[0].timestamp >= now);
+    }
+
+    fn timestamp() -> DateTime<Utc> {
+        Utc.ymd(2021, 2, 3).and_hms_milli(4, 5, 6, 789)
     }
 }

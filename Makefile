@@ -1,6 +1,9 @@
 # .PHONY: $(MAKECMDGOALS) all
 .DEFAULT_GOAL := help
 
+mkfile_path := $(abspath $(lastword $(MAKEFILE_LIST)))
+mkfile_dir := $(dir $(mkfile_path))
+
 # Begin OS detection
 ifeq ($(OS),Windows_NT) # is Windows_NT on XP, 2000, 7, Vista, 10...
     export OPERATING_SYSTEM := Windows
@@ -13,9 +16,11 @@ else
 endif
 
 # Override this with any scopes for testing/benching.
-export SCOPE ?= ""
+export SCOPE ?=
 # Override this with any extra flags for cargo bench
-export CARGO_BENCH_FLAGS ?= ""
+export CARGO_BENCH_FLAGS ?=
+# override this to put criterion output elsewhere
+export CRITERION_HOME ?= $(mkfile_dir)target/criterion
 # Override to false to disable autospawning services on integration tests.
 export AUTOSPAWN ?= true
 # Override to control if services are turned off after integration tests.
@@ -163,6 +168,7 @@ environment-push: environment-prepare ## Publish a new version of the container 
 
 ##@ Building
 .PHONY: build
+build: export CFLAGS += -g0 -O3
 build: ## Build the project in release mode (Supports `ENVIRONMENT=true`)
 	${MAYBE_ENVIRONMENT_EXEC} cargo build --release --no-default-features --features ${DEFAULT_FEATURES}
 	${MAYBE_ENVIRONMENT_COPY_ARTIFACTS}
@@ -214,7 +220,7 @@ cross-%: export PAIR =$(subst -, ,$($(strip @):cross-%=%))
 cross-%: export COMMAND ?=$(word 1,${PAIR})
 cross-%: export TRIPLE ?=$(subst ${SPACE},-,$(wordlist 2,99,${PAIR}))
 cross-%: export PROFILE ?= release
-cross-%: export RUSTFLAGS += -C link-arg=-s
+cross-%: export CFLAGS += -g0 -O3
 cross-%: cargo-install-cross
 	$(MAKE) -k cross-image-${TRIPLE}
 	cross ${COMMAND} \
@@ -226,7 +232,7 @@ cross-%: cargo-install-cross
 target/%/vector: export PAIR =$(subst /, ,$(@:target/%/vector=%))
 target/%/vector: export TRIPLE ?=$(word 1,${PAIR})
 target/%/vector: export PROFILE ?=$(word 2,${PAIR})
-target/%/vector: export RUSTFLAGS += -C link-arg=-s
+target/%/vector: export CFLAGS += -g0 -O3
 target/%/vector: cargo-install-cross CARGO_HANDLES_FRESHNESS
 	$(MAKE) -k cross-image-${TRIPLE}
 	cross build \
@@ -272,14 +278,7 @@ cross-image-%:
 
 .PHONY: test
 test: ## Run the unit test suite
-	${MAYBE_ENVIRONMENT_EXEC} cargo test --no-fail-fast --no-default-features --workspace --features ${DEFAULT_FEATURES} ${SCOPE} --all-targets -- --nocapture
-
-.PHONY: test-components
-test-components: ## Test with all components enabled
-# TODO(jesse) add `wasm-benches` when https://github.com/timberio/vector/issues/5106 is fixed
-# test-components: $(WASM_MODULE_OUTPUTS)
-test-components: export DEFAULT_FEATURES:="${DEFAULT_FEATURES} benches remap-benches"
-test-components: test
+	${MAYBE_ENVIRONMENT_EXEC} cargo test --quiet --workspace --no-fail-fast --no-default-features --features "${DEFAULT_FEATURES} metrics-benches remap-benches statistic-benches benches" ${SCOPE}
 
 .PHONY: test-all
 test-all: test test-behavior test-integration ## Runs all tests, unit, behaviorial, and integration.
@@ -301,7 +300,8 @@ test-integration: ## Runs all integration tests
 test-integration: test-integration-aws test-integration-clickhouse test-integration-docker-logs test-integration-elasticsearch
 test-integration: test-integration-gcp test-integration-humio test-integration-influxdb test-integration-kafka
 test-integration: test-integration-loki test-integration-mongodb_metrics test-integration-nats
-test-integration: test-integration-nginx test-integration-prometheus test-integration-pulsar test-integration-splunk
+test-integration: test-integration-nginx test-integration-postgresql_metrics test-integration-prometheus test-integration-pulsar
+test-integration: test-integration-splunk
 
 .PHONY: test-integration-aws
 test-integration-aws: ## Runs AWS integration tests
@@ -434,9 +434,21 @@ ifeq ($(AUTOSPAWN), true)
 	@scripts/setup_integration_env.sh nginx stop
 	@scripts/setup_integration_env.sh nginx start
 endif
-	${MAYBE_ENVIRONMENT_EXEC} cargo test --no-fail-fast --no-default-features --features nginx-integration-tests --lib ::nginx:: -- --nocapture
+	${MAYBE_ENVIRONMENT_EXEC} cargo test --no-fail-fast --no-default-features --features nginx-integration-tests --lib ::nginx_metrics:: -- --nocapture
 ifeq ($(AUTODESPAWN), true)
 	@scripts/setup_integration_env.sh nginx stop
+endif
+
+.PHONY: test-integration-postgresql_metrics
+test-integration-postgresql_metrics: ## Runs postgresql_metrics integration tests
+ifeq ($(AUTOSPAWN), true)
+	@scripts/setup_integration_env.sh postgresql_metrics stop
+	@scripts/setup_integration_env.sh postgresql_metrics start
+	sleep 5 # Many services are very slow... Give them a sec..
+endif
+	${MAYBE_ENVIRONMENT_EXEC} cargo test --no-fail-fast --no-default-features --features postgresql_metrics-integration-tests --lib ::postgresql_metrics:: -- --nocapture
+ifeq ($(AUTODESPAWN), true)
+	@scripts/setup_integration_env.sh postgresql_metrics stop
 endif
 
 .PHONY: test-integration-prometheus
@@ -496,12 +508,13 @@ endif
 
 .PHONY: test-cli
 test-cli: ## Runs cli tests
-	${MAYBE_ENVIRONMENT_EXEC} cargo test --no-fail-fast --no-default-features --test cli -- --test-threads 4
+	${MAYBE_ENVIRONMENT_EXEC} cargo test --no-fail-fast --no-default-features --features cli-tests --test cli -- --test-threads 4
 
 .PHONY: test-wasm-build-modules
 test-wasm-build-modules: $(WASM_MODULE_OUTPUTS) ### Build all WASM test modules
 
 $(WASM_MODULE_OUTPUTS): MODULE = $(notdir $@)
+$(WASM_MODULE_OUTPUTS): export CFLAGS += -g0 -O3
 $(WASM_MODULE_OUTPUTS): ### Build a specific WASM module
 	@echo "# Building WASM module ${MODULE}, requires Rustc for wasm32-wasi."
 	${MAYBE_ENVIRONMENT_EXEC} cargo build \
@@ -514,13 +527,18 @@ $(WASM_MODULE_OUTPUTS): ### Build a specific WASM module
 test-wasm: export TEST_THREADS=1
 test-wasm: export TEST_LOG=vector=trace
 test-wasm: $(WASM_MODULE_OUTPUTS)  ### Run engine tests
-	${MAYBE_ENVIRONMENT_EXEC} cargo test wasm --no-fail-fast --no-default-features --features "transforms-field_filter transforms-wasm transforms-lua transforms-add_fields" --lib --all-targets -- --nocapture
+	${MAYBE_ENVIRONMENT_EXEC} cargo test wasm --no-fail-fast --no-default-features --features "transforms-field_filter transforms-wasm transforms-lua transforms-add_fields" -- --nocapture
 
 ##@ Benching (Supports `ENVIRONMENT=true`)
 
 .PHONY: bench
 bench: ## Run benchmarks in /benches
 	${MAYBE_ENVIRONMENT_EXEC} cargo bench --no-default-features --features "benches" ${CARGO_BENCH_FLAGS}
+	${MAYBE_ENVIRONMENT_COPY_ARTIFACTS}
+
+.PHONY: bench-remap-functions
+bench-remap-functions: ## Run remap-functions benches
+	${MAYBE_ENVIRONMENT_EXEC} CRITERION_HOME="$(CRITERION_HOME)" cargo bench --manifest-path lib/vrl/stdlib/Cargo.toml ${CARGO_BENCH_FLAGS}
 	${MAYBE_ENVIRONMENT_COPY_ARTIFACTS}
 
 .PHONY: bench-remap
@@ -530,13 +548,23 @@ bench-remap: ## Run remap benches
 
 .PHONY: bench-wasm
 bench-wasm: $(WASM_MODULE_OUTPUTS)  ### Run WASM benches
-	${MAYBE_ENVIRONMENT_EXEC} cargo bench --no-default-features --features "wasm-benches" --bench wasm wasm ${CARGO_BENCH_FLAGS}
+	${MAYBE_ENVIRONMENT_EXEC} cargo bench --no-default-features --features "wasm-benches" --bench wasm ${CARGO_BENCH_FLAGS}
+	${MAYBE_ENVIRONMENT_COPY_ARTIFACTS}
+
+.PHONY: bench-languages
+bench-languages: $(WASM_MODULE_OUTPUTS)  ### Run language comparison benches
+	${MAYBE_ENVIRONMENT_EXEC} cargo bench --no-default-features --features "language-benches" --bench languages ${CARGO_BENCH_FLAGS}
+	${MAYBE_ENVIRONMENT_COPY_ARTIFACTS}
+
+.PHONY: bench-metrics
+bench-metrics: ## Run metrics benches
+	${MAYBE_ENVIRONMENT_EXEC} cargo bench --no-default-features --features "metrics-benches" ${CARGO_BENCH_FLAGS}
 	${MAYBE_ENVIRONMENT_COPY_ARTIFACTS}
 
 .PHONY: bench-all
 bench-all: ### Run all benches
-bench-all: $(WASM_MODULE_OUTPUTS)
-	${MAYBE_ENVIRONMENT_EXEC} cargo bench --no-default-features --features "benches remap-benches wasm-benches" ${CARGO_BENCH_FLAGS}
+bench-all: $(WASM_MODULE_OUTPUTS) bench-remap-functions
+	${MAYBE_ENVIRONMENT_EXEC} cargo bench --no-default-features --features "benches remap-benches wasm-benches metrics-benches language-benches" ${CARGO_BENCH_FLAGS}
 	${MAYBE_ENVIRONMENT_COPY_ARTIFACTS}
 
 ##@ Checking
@@ -550,11 +578,12 @@ check-all: ## Check everything
 check-all: check-fmt check-clippy check-style check-markdown check-docs
 check-all: check-version check-examples check-component-features
 check-all: check-scripts
-check-all: check-helm-lint check-helm-dependencies check-kubernetes-yaml
+check-all: check-helm-lint check-helm-dependencies check-helm-snapshots
+check-all: check-kubernetes-yaml
 
 .PHONY: check-component-features
 check-component-features: ## Check that all component features are setup properly
-	${MAYBE_ENVIRONMENT_EXEC} ./scripts/check-component-features.sh
+	${MAYBE_ENVIRONMENT_EXEC} cargo hack check --each-feature --exclude-features "sources-utils-http sources-utils-tcp-keepalive sources-utils-tcp-socket sources-utils-tls sources-utils-udp sources-utils-unix sinks-utils-udp"
 
 .PHONY: check-clippy
 check-clippy: ## Check code with Clippy
@@ -582,7 +611,7 @@ check-version: ## Check that Vector's version is correct accounting for recent c
 
 .PHONY: check-examples
 check-examples: ## Check that the config/examples files are valid
-	${MAYBE_ENVIRONMENT_EXEC} cargo run -- validate --topology --deny-warnings ./config/examples/*.toml
+	${MAYBE_ENVIRONMENT_EXEC} ./scripts/check-examples.sh
 
 .PHONY: check-scripts
 check-scripts: ## Check that scipts do not have common mistakes
@@ -596,12 +625,21 @@ check-helm-lint: ## Check that Helm charts pass helm lint
 check-helm-dependencies: ## Check that Helm charts have up-to-date dependencies
 	${MAYBE_ENVIRONMENT_EXEC} ./scripts/helm-dependencies.sh validate
 
+.PHONY: check-helm-snapshots
+check-helm-snapshots: ## Check that the Helm template snapshots do not diverge from the Helm charts
+	${MAYBE_ENVIRONMENT_EXEC} ./scripts/helm-template-snapshot.sh check
+
 .PHONY: check-kubernetes-yaml
 check-kubernetes-yaml: ## Check that the generated Kubernetes YAML configs are up to date
 	${MAYBE_ENVIRONMENT_EXEC} ./scripts/kubernetes-yaml.sh check
 
 check-events: ## Check that events satisfy patterns set in https://github.com/timberio/vector/blob/master/rfcs/2020-03-17-2064-event-driven-observability.md
 	${MAYBE_ENVIRONMENT_EXEC} ./scripts/check-events.sh
+
+##@ Rustdoc
+build-rustdoc: ## Build Vector's Rustdocs
+	# This command is mostly intended for use by the build process in timberio/vector-rustdoc
+	${MAYBE_ENVIRONMENT_EXEC} cargo doc --no-deps
 
 ##@ Packaging
 
@@ -626,10 +664,10 @@ package-x86_64-unknown-linux-gnu-all: package-x86_64-unknown-linux-gnu package-d
 package-x86_64-unknown-linux-musl-all: package-x86_64-unknown-linux-musl # Build all x86_64 MUSL packages
 
 .PHONY: package-aarch64-unknown-linux-musl-all
-package-aarch64-unknown-linux-musl-all: package-aarch64-unknown-linux-musl package-deb-aarch64 package-rpm-aarch64  # Build all aarch64 MUSL packages
+package-aarch64-unknown-linux-musl-all: package-aarch64-unknown-linux-musl # Build all aarch64 MUSL packages
 
 .PHONY: package-aarch64-unknown-linux-gnu-all
-package-aarch64-unknown-linux-gnu-all: package-aarch64-unknown-linux-gnu # Build all aarch64 GNU packages
+package-aarch64-unknown-linux-gnu-all: package-aarch64-unknown-linux-gnu package-deb-aarch64 package-rpm-aarch64 # Build all aarch64 GNU packages
 
 .PHONY: package-armv7-unknown-linux-gnueabihf-all
 package-armv7-unknown-linux-gnueabihf-all: package-armv7-unknown-linux-gnueabihf package-deb-armv7-gnu package-rpm-armv7-gnu  # Build all armv7-unknown-linux-gnueabihf MUSL packages
@@ -669,8 +707,8 @@ package-deb-x86_64-unknown-linux-musl: package-x86_64-unknown-linux-musl ## Buil
 	$(CONTAINER_TOOL) run -v  $(PWD):/git/timberio/vector/ -e TARGET=x86_64-unknown-linux-musl timberio/ci_image ./scripts/package-deb.sh
 
 .PHONY: package-deb-aarch64
-package-deb-aarch64: package-aarch64-unknown-linux-musl  ## Build the aarch64 deb package
-	$(CONTAINER_TOOL) run -v  $(PWD):/git/timberio/vector/ -e TARGET=aarch64-unknown-linux-musl timberio/ci_image ./scripts/package-deb.sh
+package-deb-aarch64: package-aarch64-unknown-linux-gnu ## Build the aarch64 deb package
+	$(CONTAINER_TOOL) run -v  $(PWD):/git/timberio/vector/ -e TARGET=aarch64-unknown-linux-gnu timberio/ci_image ./scripts/package-deb.sh
 
 .PHONY: package-deb-armv7-gnu
 package-deb-armv7-gnu: package-armv7-unknown-linux-gnueabihf ## Build the armv7-unknown-linux-gnueabihf deb package
@@ -687,8 +725,8 @@ package-rpm-x86_64-unknown-linux-musl: package-x86_64-unknown-linux-musl ## Buil
 	$(CONTAINER_TOOL) run -v  $(PWD):/git/timberio/vector/ -e TARGET=x86_64-unknown-linux-musl timberio/ci_image ./scripts/package-rpm.sh
 
 .PHONY: package-rpm-aarch64
-package-rpm-aarch64: package-aarch64-unknown-linux-musl ## Build the aarch64 rpm package
-	$(CONTAINER_TOOL) run -v  $(PWD):/git/timberio/vector/ -e TARGET=aarch64-unknown-linux-musl timberio/ci_image ./scripts/package-rpm.sh
+package-rpm-aarch64: package-aarch64-unknown-linux-gnu ## Build the aarch64 rpm package
+	$(CONTAINER_TOOL) run -v  $(PWD):/git/timberio/vector/ -e TARGET=aarch64-unknown-linux-gnu timberio/ci_image ./scripts/package-rpm.sh
 
 .PHONY: package-rpm-armv7-gnu
 package-rpm-armv7-gnu: package-armv7-unknown-linux-gnueabihf ## Build the armv7-unknown-linux-gnueabihf rpm package
@@ -739,6 +777,12 @@ release-helm: ## Package and release Helm Chart
 sync-install: ## Sync the install.sh script for access via sh.vector.dev
 	@aws s3 cp distribution/install.sh s3://sh.vector.dev --sse --acl public-read
 
+##@ Vector Remap Language
+
+.PHONY: test-vrl
+test-vrl: ## Run the VRL test suite
+	@scripts/test-vrl.sh
+
 ##@ Utility
 
 .PHONY: build-ci-docker-images
@@ -786,6 +830,10 @@ git-hooks: ## Add Vector-local git hooks for commit sign-off
 .PHONY: update-helm-dependencies
 update-helm-dependencies: ## Recursively update the dependencies of the Helm charts in the proper order
 	${MAYBE_ENVIRONMENT_EXEC} ./scripts/helm-dependencies.sh update
+
+.PHONY: update-helm-snapshots
+update-helm-snapshots: ## Update the Helm template snapshots from the Helm charts
+	${MAYBE_ENVIRONMENT_EXEC} ./scripts/helm-template-snapshot.sh update
 
 .PHONY: update-kubernetes-yaml
 update-kubernetes-yaml: ## Regenerate the Kubernetes YAML configs

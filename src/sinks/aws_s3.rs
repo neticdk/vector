@@ -1,16 +1,18 @@
 use crate::{
     config::{log_schema, DataType, GenerateConfig, SinkConfig, SinkContext, SinkDescription},
-    rusoto::{self, RegionOrEndpoint},
+    event::Event,
+    internal_events::TemplateRenderingFailed,
+    rusoto::{self, AwsAuthentication, RegionOrEndpoint},
     serde::to_string,
     sinks::util::{
+        batch::{BatchConfig, BatchSettings},
         encoding::{EncodingConfig, EncodingConfiguration},
         retries::RetryLogic,
         sink::Response,
-        BatchConfig, BatchSettings, Buffer, Compression, Concurrency, PartitionBatchSink,
-        PartitionBuffer, PartitionInnerBuffer, ServiceBuilderExt, TowerRequestConfig,
+        Buffer, Compression, Concurrency, EncodedEvent, PartitionBatchSink, PartitionBuffer,
+        PartitionInnerBuffer, ServiceBuilderExt, TowerRequestConfig,
     },
     template::Template,
-    Event,
 };
 use bytes::Bytes;
 use chrono::Utc;
@@ -56,7 +58,10 @@ pub struct S3SinkConfig {
     pub batch: BatchConfig,
     #[serde(default)]
     pub request: TowerRequestConfig,
-    pub assume_role: Option<String>,
+    // Deprecated name. Moved to auth.
+    assume_role: Option<String>,
+    #[serde(default)]
+    pub auth: AwsAuthentication,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -92,7 +97,7 @@ enum S3CannedAcl {
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 enum S3ServerSideEncryption {
     #[serde(rename = "AES256")]
-    AES256,
+    Aes256,
     #[serde(rename = "aws:kms")]
     AwsKms,
 }
@@ -105,10 +110,8 @@ enum S3StorageClass {
     Standard,
     ReducedRedundancy,
     IntelligentTiering,
-    #[serde(rename = "STANDARD_IA")]
-    StandardIA,
-    #[serde(rename = "ONEZONE_IA")]
-    OnezoneIA,
+    StandardIa,
+    OnezoneIa,
     Glacier,
     DeepArchive,
 }
@@ -147,6 +150,7 @@ impl GenerateConfig for S3SinkConfig {
             batch: BatchConfig::default(),
             request: TowerRequestConfig::default(),
             assume_role: None,
+            auth: AwsAuthentication::default(),
         })
         .unwrap()
     }
@@ -236,6 +240,7 @@ impl S3SinkConfig {
     pub async fn healthcheck(self, client: S3Client) -> crate::Result<()> {
         let req = client.head_bucket(HeadBucketRequest {
             bucket: self.bucket.clone(),
+            expected_bucket_owner: None,
         });
 
         match req.await {
@@ -258,7 +263,7 @@ impl S3SinkConfig {
         let region = (&self.region).try_into()?;
         let client = rusoto::client()?;
 
-        let creds = rusoto::AwsCredentialsProvider::new(&region, self.assume_role.clone())?;
+        let creds = self.auth.build(&region, self.assume_role.clone())?;
 
         Ok(S3Client::new_with(client, creds, region))
     }
@@ -390,15 +395,15 @@ fn encode_event(
     mut event: Event,
     key_prefix: &Template,
     encoding: &EncodingConfig<Encoding>,
-) -> Option<PartitionInnerBuffer<Vec<u8>, Bytes>> {
+) -> Option<EncodedEvent<PartitionInnerBuffer<Vec<u8>, Bytes>>> {
     let key = key_prefix
         .render_string(&event)
-        .map_err(|missing_keys| {
-            warn!(
-                message = "Keys do not exist on the event; dropping event.",
-                ?missing_keys,
-                internal_log_rate_secs = 30,
-            );
+        .map_err(|error| {
+            emit!(TemplateRenderingFailed {
+                error,
+                field: Some("key_prefix"),
+                drop_event: true,
+            });
         })
         .ok()?;
 
@@ -422,7 +427,11 @@ fn encode_event(
         }
     };
 
-    Some(PartitionInnerBuffer::new(bytes, key.into()))
+    let (_fields, metadata) = log.into_parts();
+    Some(EncodedEvent {
+        item: PartitionInnerBuffer::new(bytes, key.into()),
+        metadata: Some(metadata),
+    })
 }
 
 #[cfg(test)]
@@ -438,7 +447,7 @@ mod tests {
     fn s3_encode_event_text() {
         let message = "hello world".to_string();
         let batch_time_format = Template::try_from("date=%F").unwrap();
-        let bytes = encode_event(
+        let encoded = encode_event(
             message.clone().into(),
             &batch_time_format,
             &Encoding::Text.into(),
@@ -446,7 +455,7 @@ mod tests {
         .unwrap();
 
         let encoded_message = message + "\n";
-        let (bytes, _) = bytes.into_parts();
+        let (bytes, _) = encoded.item.into_parts();
         assert_eq!(&bytes[..], encoded_message.as_bytes());
     }
 
@@ -457,9 +466,9 @@ mod tests {
         event.as_mut_log().insert("key", "value");
 
         let batch_time_format = Template::try_from("date=%F").unwrap();
-        let bytes = encode_event(event, &batch_time_format, &Encoding::Ndjson.into()).unwrap();
+        let encoded = encode_event(event, &batch_time_format, &Encoding::Ndjson.into()).unwrap();
 
-        let (bytes, _) = bytes.into_parts();
+        let (bytes, _) = encoded.item.into_parts();
         let map: BTreeMap<String, String> = serde_json::from_slice(&bytes[..]).unwrap();
 
         assert_eq!(map[&log_schema().message_key().to_string()], message);
@@ -482,9 +491,9 @@ mod tests {
             timestamp_format: None,
         };
 
-        let bytes = encode_event(event, &key_prefix, &encoding_config).unwrap();
+        let encoded = encode_event(event, &key_prefix, &encoding_config).unwrap();
 
-        let (bytes, _) = bytes.into_parts();
+        let (bytes, _) = encoded.item.into_parts();
         let map: BTreeMap<String, String> = serde_json::from_slice(&bytes[..]).unwrap();
 
         assert_eq!(map[&log_schema().message_key().to_string()], message);
@@ -546,10 +555,10 @@ mod tests {
             ("DEEP_ARCHIVE", S3StorageClass::DeepArchive),
             ("GLACIER", S3StorageClass::Glacier),
             ("INTELLIGENT_TIERING", S3StorageClass::IntelligentTiering),
-            ("ONEZONE_IA", S3StorageClass::OnezoneIA),
+            ("ONEZONE_IA", S3StorageClass::OnezoneIa),
             ("REDUCED_REDUNDANCY", S3StorageClass::ReducedRedundancy),
             ("STANDARD", S3StorageClass::Standard),
-            ("STANDARD_IA", S3StorageClass::StandardIA),
+            ("STANDARD_IA", S3StorageClass::StandardIa),
         ] {
             assert_eq!(name, to_string(storage_class));
             let result: S3StorageClass = serde_json::from_str(&format!("{:?}", name))
@@ -569,11 +578,13 @@ mod integration_tests {
         assert_downcast_matches,
         test_util::{random_lines_with_stream, random_string},
     };
-    use bytes::{buf::BufExt, BytesMut};
-    use flate2::read::GzDecoder;
+    use bytes::{Buf, BytesMut};
+    use flate2::read::MultiGzDecoder;
+    use futures::Stream;
     use pretty_assertions::assert_eq;
     use rusoto_core::region::Region;
     use std::io::{BufRead, BufReader};
+    use vector_core::event::{BatchNotifier, BatchStatus, BatchStatusReceiver, LogEvent};
 
     const BUCKET: &str = "router-tests";
 
@@ -586,8 +597,9 @@ mod integration_tests {
         let client = config.create_client().unwrap();
         let sink = config.new(client, cx).unwrap();
 
-        let (lines, events) = random_lines_with_stream(100, 10);
+        let (lines, events, mut receiver) = make_events_batch(100, 10);
         sink.run(events).await.unwrap();
+        assert_eq!(receiver.try_recv(), Ok(BatchStatus::Delivered));
 
         let keys = get_keys(prefix.unwrap()).await;
         assert_eq!(keys.len(), 1);
@@ -616,10 +628,10 @@ mod integration_tests {
         let client = config.create_client().unwrap();
         let sink = config.new(client, cx).unwrap();
 
-        let (lines, _events) = random_lines_with_stream(100, 30);
+        let (lines, _events) = random_lines_with_stream(100, 30, None);
 
         let events = lines.clone().into_iter().enumerate().map(|(i, line)| {
-            let mut e = Event::from(line);
+            let mut e = LogEvent::from(line);
             let i = if i < 10 {
                 1
             } else if i < 20 {
@@ -627,9 +639,10 @@ mod integration_tests {
             } else {
                 3
             };
-            e.as_mut_log().insert("i", format!("{}", i));
-            e
+            e.insert("i", format!("{}", i));
+            Event::from(e)
         });
+
         sink.run(stream::iter(events)).await.unwrap();
 
         let keys = get_keys(prefix.unwrap()).await;
@@ -661,8 +674,9 @@ mod integration_tests {
         let client = config.create_client().unwrap();
         let sink = config.new(client, cx).unwrap();
 
-        let (lines, events) = random_lines_with_stream(100, 500);
+        let (lines, events, mut receiver) = make_events_batch(100, 500);
         sink.run(events).await.unwrap();
+        assert_eq!(receiver.try_recv(), Ok(BatchStatus::Delivered));
 
         let keys = get_keys(prefix.unwrap()).await;
         assert_eq!(keys.len(), 6);
@@ -678,6 +692,25 @@ mod integration_tests {
         });
 
         assert_eq!(lines, response_lines.await);
+    }
+
+    #[tokio::test]
+    async fn acknowledges_failures() {
+        let cx = SinkContext::new_test();
+
+        let mut config = config(1).await;
+        // Break the bucket name
+        config.bucket = format!("BREAK{}IT", config.bucket);
+        let prefix = config.key_prefix.clone();
+        let client = config.create_client().unwrap();
+        let sink = config.new(client, cx).unwrap();
+
+        let (_lines, events, mut receiver) = make_events_batch(1, 1);
+        sink.run(events).await.unwrap();
+        assert_eq!(receiver.try_recv(), Ok(BatchStatus::Errored));
+
+        let objects = list_objects(prefix.unwrap()).await;
+        assert_eq!(objects, None);
     }
 
     #[tokio::test]
@@ -697,7 +730,7 @@ mod integration_tests {
         assert_downcast_matches!(
             config.healthcheck(client).await.unwrap_err(),
             HealthcheckError,
-            HealthcheckError::UnknownBucket{ .. }
+            HealthcheckError::UnknownBucket { .. }
         );
     }
 
@@ -736,7 +769,20 @@ mod integration_tests {
             },
             request: TowerRequestConfig::default(),
             assume_role: None,
+            auth: Default::default(),
         }
+    }
+
+    fn make_events_batch(
+        len: usize,
+        count: usize,
+    ) -> (Vec<String>, impl Stream<Item = Event>, BatchStatusReceiver) {
+        let (lines, events) = random_lines_with_stream(len, count, None);
+
+        let (batch, receiver) = BatchNotifier::new_with_receiver();
+        let events = events.map(move |event| event.into_log().with_batch_notifier(&batch).into());
+
+        (lines, events, receiver)
     }
 
     async fn ensure_bucket(client: &S3Client) {
@@ -759,20 +805,23 @@ mod integration_tests {
         }
     }
 
-    async fn get_keys(prefix: String) -> Vec<String> {
+    async fn list_objects(prefix: String) -> Option<Vec<rusoto_s3::Object>> {
         let prefix = prefix.split('/').next().unwrap().to_string();
 
-        let list_res = client()
+        client()
             .list_objects_v2(rusoto_s3::ListObjectsV2Request {
                 bucket: BUCKET.to_string(),
                 prefix: Some(prefix),
                 ..Default::default()
             })
             .await
-            .unwrap();
-
-        list_res
+            .unwrap()
             .contents
+    }
+
+    async fn get_keys(prefix: String) -> Vec<String> {
+        list_objects(prefix)
+            .await
             .unwrap()
             .into_iter()
             .map(|obj| obj.key.unwrap())
@@ -798,7 +847,7 @@ mod integration_tests {
 
     async fn get_gzipped_lines(obj: rusoto_s3::GetObjectOutput) -> Vec<String> {
         let body = get_object_output_body(obj).await;
-        let buf_read = BufReader::new(GzDecoder::new(body));
+        let buf_read = BufReader::new(MultiGzDecoder::new(body));
         buf_read.lines().map(|l| l.unwrap()).collect()
     }
 

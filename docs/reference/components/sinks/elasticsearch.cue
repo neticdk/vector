@@ -9,6 +9,7 @@ components: sinks: elasticsearch: {
 		development:   "stable"
 		egress_method: "batch"
 		service_providers: ["AWS", "Azure", "Elastic", "GCP"]
+		stateful: false
 	}
 
 	features: {
@@ -19,7 +20,6 @@ components: sinks: elasticsearch: {
 				enabled:      true
 				common:       false
 				max_bytes:    10490000
-				max_events:   null
 				timeout_secs: 1
 			}
 			compression: {
@@ -69,14 +69,15 @@ components: sinks: elasticsearch: {
 
 	support: {
 		targets: {
-			"aarch64-unknown-linux-gnu":  true
-			"aarch64-unknown-linux-musl": true
-			"x86_64-apple-darwin":        true
-			"x86_64-pc-windows-msv":      true
-			"x86_64-unknown-linux-gnu":   true
-			"x86_64-unknown-linux-musl":  true
+			"aarch64-unknown-linux-gnu":      true
+			"aarch64-unknown-linux-musl":     true
+			"armv7-unknown-linux-gnueabihf":  true
+			"armv7-unknown-linux-musleabihf": true
+			"x86_64-apple-darwin":            true
+			"x86_64-pc-windows-msv":          true
+			"x86_64-unknown-linux-gnu":       true
+			"x86_64-unknown-linux-musl":      true
 		}
-
 		requirements: [
 			#"""
 				Elasticsearch's Data streams feature requires Vector to be configured with the `create` `bulk_action`. *This is not enabled by default.*
@@ -94,23 +95,14 @@ components: sinks: elasticsearch: {
 			warnings: []
 			type: object: {
 				examples: []
-				options: {
-					assume_role: {
-						common:      false
-						description: "The ARN of an [IAM role](\(urls.aws_iam_role)) to assume at startup."
-						required:    false
-						warnings: []
-						type: string: {
-							default: null
-							examples: ["arn:aws:iam::123456789098:role/my_role"]
-						}
-					}
+				options: components._aws.configuration.auth.type.object.options & {
 					password: {
 						description: "The basic authentication password."
 						required:    true
 						warnings: []
 						type: string: {
 							examples: ["${ELASTICSEARCH_PASSWORD}", "password"]
+							syntax: "literal"
 						}
 					}
 					strategy: {
@@ -122,6 +114,7 @@ components: sinks: elasticsearch: {
 								aws:   "Authentication strategy used for [AWS' hosted Elasticsearch service](\(urls.aws_elasticsearch))."
 								basic: "The [basic authentication strategy](\(urls.basic_auth))."
 							}
+							syntax: "literal"
 						}
 					}
 					user: {
@@ -130,6 +123,7 @@ components: sinks: elasticsearch: {
 						warnings: []
 						type: string: {
 							examples: ["${ELASTICSEARCH_USERNAME}", "username"]
+							syntax: "literal"
 						}
 					}
 				}
@@ -151,6 +145,7 @@ components: sinks: elasticsearch: {
 						type: string: {
 							default: null
 							examples: ["us-east-1"]
+							syntax: "literal"
 						}
 					}
 				}
@@ -158,12 +153,13 @@ components: sinks: elasticsearch: {
 		}
 		bulk_action: {
 			common:      false
-			description: "Action to use when making requests to the [Elasticsearch Bulk API](elasticsearch_bulk). Supports `index` and `create`."
+			description: "Action to use when making requests to the [Elasticsearch Bulk API](elasticsearch_bulk). Currently, Vector only supports `index` and `create`. `update` and `delete` actions are not supported."
 			required:    false
 			warnings: []
 			type: string: {
 				default: "index"
 				examples: ["index", "create"]
+				syntax: "literal"
 			}
 		}
 		doc_type: {
@@ -173,6 +169,7 @@ components: sinks: elasticsearch: {
 			warnings: []
 			type: string: {
 				default: "_doc"
+				syntax:  "literal"
 			}
 		}
 		endpoint: {
@@ -181,6 +178,7 @@ components: sinks: elasticsearch: {
 			warnings: []
 			type: string: {
 				examples: ["http://10.24.32.122:9000", "https://example.com", "https://user:password@example.com"]
+				syntax: "literal"
 			}
 		}
 		id_key: {
@@ -191,6 +189,7 @@ components: sinks: elasticsearch: {
 			type: string: {
 				default: null
 				examples: ["id", "_id"]
+				syntax: "literal"
 			}
 		}
 		index: {
@@ -201,7 +200,7 @@ components: sinks: elasticsearch: {
 			type: string: {
 				default: "vector-%F"
 				examples: ["application-{{ application_id }}-%Y-%m-%d", "vector-%Y-%m-%d"]
-				templateable: true
+				syntax: "template"
 			}
 		}
 		pipeline: {
@@ -212,6 +211,7 @@ components: sinks: elasticsearch: {
 			type: string: {
 				default: null
 				examples: ["pipeline-name"]
+				syntax: "literal"
 			}
 		}
 		query: {
@@ -237,7 +237,7 @@ components: sinks: elasticsearch: {
 			body: """
 				Vector [batches](#buffers--batches) data flushes it to Elasticsearch's
 				[`_bulk` API endpoint][urls.elasticsearch_bulk]. By default, all events are
-				inserted via the `index` action which will update documents if an existing
+				inserted via the `index` action which will replace documents if an existing
 				one has the same `id`. If `bulk_action` is configured with `create`, Elasticsearch
 				will _not_ replace an existing document and instead return a conflict error.
 				"""
@@ -262,9 +262,12 @@ components: sinks: elasticsearch: {
 					[`ignore_malformed` setting](\(urls.elasticsearch_ignore_malformed)).
 					"""
 		}
+
+		aws_authentication: components._aws.how_it_works.aws_authentication
 	}
 
 	telemetry: metrics: {
-		missing_keys_total: components.sources.internal_metrics.output.metrics.missing_keys_total
+		events_discarded_total:  components.sources.internal_metrics.output.metrics.events_discarded_total
+		processing_errors_total: components.sources.internal_metrics.output.metrics.processing_errors_total
 	}
 }

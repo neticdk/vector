@@ -1,13 +1,13 @@
 use crate::{
     config::{log_schema, DataType, GenerateConfig, SinkConfig, SinkContext, SinkDescription},
+    event::Event,
     sinks::util::{
         encoding::{EncodingConfig, EncodingConfiguration},
         tcp::TcpSinkConfig,
-        Encoding, UriSerde,
+        EncodedEvent, Encoding, UriSerde,
     },
     tcp::TcpKeepaliveConfig,
     tls::TlsConfig,
-    Event,
 };
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
@@ -21,6 +21,7 @@ pub struct PapertrailConfig {
     encoding: EncodingConfig<Encoding>,
     keepalive: Option<TcpKeepaliveConfig>,
     tls: Option<TlsConfig>,
+    send_buffer_bytes: Option<usize>,
 }
 
 inventory::submit! {
@@ -57,14 +58,14 @@ impl SinkConfig for PapertrailConfig {
             .ok_or_else(|| "A port is required for endpoint".to_string())?;
 
         let address = format!("{}:{}", host, port);
-        let keepalive = self.keepalive;
         let tls = Some(self.tls.clone().unwrap_or_else(TlsConfig::enabled));
 
         let pid = std::process::id();
         let encoding = self.encoding.clone();
 
-        let sink_config = TcpSinkConfig::new(address, keepalive, tls);
-        sink_config.build(cx, move |event| encode_event(event, pid, &encoding))
+        let sink_config = TcpSinkConfig::new(address, self.keepalive, tls, self.send_buffer_bytes);
+
+        sink_config.build(cx, move |event| Some(encode_event(event, pid, &encoding)))
     }
 
     fn input_type(&self) -> DataType {
@@ -76,12 +77,15 @@ impl SinkConfig for PapertrailConfig {
     }
 }
 
-fn encode_event(mut event: Event, pid: u32, encoding: &EncodingConfig<Encoding>) -> Option<Bytes> {
-    let host = if let Some(host) = event.as_mut_log().remove(log_schema().host_key()) {
-        Some(host.to_string_lossy())
-    } else {
-        None
-    };
+fn encode_event(
+    mut event: Event,
+    pid: u32,
+    encoding: &EncodingConfig<Encoding>,
+) -> EncodedEvent<Bytes> {
+    let host = event
+        .as_mut_log()
+        .remove(log_schema().host_key())
+        .map(|host| host.to_string_lossy());
 
     let formatter = Formatter3164 {
         facility: Facility::LOG_USER,
@@ -109,7 +113,7 @@ fn encode_event(mut event: Event, pid: u32, encoding: &EncodingConfig<Encoding>)
 
     s.push(b'\n');
 
-    Some(Bytes::from(s))
+    EncodedEvent::new(Bytes::from(s))
 }
 
 #[cfg(test)]
@@ -137,7 +141,7 @@ mod tests {
                 timestamp_format: None,
             },
         )
-        .unwrap();
+        .item;
 
         let msg =
             bytes.slice(String::from_utf8_lossy(&bytes).find(": ").unwrap() + 2..bytes.len() - 1);

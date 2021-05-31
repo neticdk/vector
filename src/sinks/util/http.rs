@@ -1,9 +1,13 @@
 use super::{
     retries::{RetryAction, RetryLogic},
-    sink, Batch, Partition, TowerBatchedSink, TowerPartitionSink, TowerRequestConfig,
+    sink, Batch, EncodedEvent, Partition, TowerBatchedSink, TowerPartitionSink, TowerRequestConfig,
     TowerRequestSettings,
 };
-use crate::{buffers::Acker, http::HttpClient, Event};
+use crate::{
+    buffers::Acker,
+    event::Event,
+    http::{HttpClient, HttpError},
+};
 use bytes::{Buf, Bytes};
 use futures::{future::BoxFuture, ready, Sink};
 use http::StatusCode;
@@ -27,7 +31,7 @@ pub trait HttpSink: Send + Sync + 'static {
     type Input;
     type Output;
 
-    fn encode_event(&self, event: Event) -> Option<Self::Input>;
+    fn encode_event(&self, event: Event) -> Option<EncodedEvent<Self::Input>>;
     async fn build_request(&self, events: Self::Output) -> crate::Result<http::Request<Vec<u8>>>;
 }
 
@@ -57,12 +61,11 @@ where
         HttpBatchService<BoxFuture<'static, crate::Result<hyper::Request<Vec<u8>>>>, B::Output>,
         B,
         L,
-        B::Output,
     >,
     // An empty slot is needed to buffer an item where we encoded it but
     // the inner sink is applying back pressure. This trick is used in the `WithFlatMap`
     // sink combinator. https://docs.rs/futures/0.1.29/src/futures/sink/with_flat_map.rs.html#20
-    slot: Option<B::Input>,
+    slot: Option<EncodedEvent<B::Input>>,
 }
 
 impl<T, B> BatchedHttpSink<T, B, HttpRetryLogic>
@@ -95,7 +98,7 @@ impl<T, B, L> BatchedHttpSink<T, B, L>
 where
     B: Batch,
     B::Output: Clone + Send + 'static,
-    L: RetryLogic<Response = http::Response<Bytes>, Error = hyper::Error> + Send + 'static,
+    L: RetryLogic<Response = http::Response<Bytes>, Error = HttpError> + Send + 'static,
     T: HttpSink<Input = B::Input, Output = B::Output>,
 {
     pub fn with_retry_logic(
@@ -193,9 +196,8 @@ where
         B,
         L,
         K,
-        B::Output,
     >,
-    slot: Option<B::Input>,
+    slot: Option<EncodedEvent<B::Input>>,
 }
 
 impl<T, B, K> PartitionHttpSink<T, B, K, HttpRetryLogic>
@@ -232,7 +234,7 @@ where
     B::Output: Clone + Send + 'static,
     B::Input: Partition<K>,
     K: Hash + Eq + Clone + Send + 'static,
-    L: RetryLogic<Response = http::Response<Bytes>, Error = hyper::Error> + Send + 'static,
+    L: RetryLogic<Response = http::Response<Bytes>, Error = HttpError> + Send + 'static,
     T: HttpSink<Input = B::Input, Output = B::Output>,
 {
     pub fn with_retry_logic(
@@ -354,7 +356,10 @@ where
             let response = http_client.call(request).await?;
             let (parts, body) = response.into_parts();
             let mut body = body::aggregate(body).await?;
-            Ok(hyper::Response::from_parts(parts, body.to_bytes()))
+            Ok(hyper::Response::from_parts(
+                parts,
+                body.copy_to_bytes(body.remaining()),
+            ))
         })
     }
 }
@@ -372,13 +377,17 @@ impl<T: fmt::Debug> sink::Response for http::Response<T> {
     fn is_successful(&self) -> bool {
         self.status().is_success()
     }
+
+    fn is_transient(&self) -> bool {
+        self.status().is_server_error()
+    }
 }
 
 #[derive(Debug, Default, Clone)]
 pub struct HttpRetryLogic;
 
 impl RetryLogic for HttpRetryLogic {
-    type Error = hyper::Error;
+    type Error = HttpError;
     type Response = hyper::Response<Bytes>;
 
     fn is_retriable_error(&self, _error: &Self::Error) -> bool {
@@ -427,8 +436,7 @@ impl RequestConfig {
 mod test {
     use super::*;
     use crate::{sinks::util::service::Concurrency, test_util::next_addr};
-    use futures::{compat::Future01CompatExt, future::ready};
-    use futures01::Stream;
+    use futures::{future::ready, StreamExt};
     use hyper::{
         service::{make_service_fn, service_fn},
         Response, Server, Uri,
@@ -469,7 +477,7 @@ mod test {
             ))
         });
 
-        let (tx, rx) = futures01::sync::mpsc::channel(10);
+        let (tx, rx) = futures::channel::mpsc::channel(10);
 
         let new_service = make_service_fn(move |_| {
             let tx = tx.clone();
@@ -478,10 +486,10 @@ mod test {
                 let mut tx = tx.clone();
 
                 async move {
-                    let body = hyper::body::aggregate(req.into_body())
+                    let mut body = hyper::body::aggregate(req.into_body())
                         .await
                         .map_err(|error| format!("error: {}", error))?;
-                    let string = String::from_utf8(body.bytes().into())
+                    let string = String::from_utf8(body.copy_to_bytes(body.remaining()).to_vec())
                         .map_err(|_| "Wasn't UTF-8".to_string())?;
                     tx.try_send(string).map_err(|_| "Send error".to_string())?;
 
@@ -498,10 +506,10 @@ mod test {
             }
         });
 
-        tokio::time::delay_for(std::time::Duration::from_millis(50)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         service.call(request).await.unwrap();
 
-        let (body, _rest) = rx.into_future().compat().await.unwrap();
+        let (body, _rest) = rx.into_future().await;
         assert_eq!(body.unwrap(), "hello");
     }
 

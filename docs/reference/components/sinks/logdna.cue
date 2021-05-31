@@ -9,6 +9,7 @@ components: sinks: logdna: {
 		development:   "stable"
 		egress_method: "batch"
 		service_providers: ["LogDNA"]
+		stateful: false
 	}
 
 	features: {
@@ -19,7 +20,6 @@ components: sinks: logdna: {
 				enabled:      true
 				common:       false
 				max_bytes:    10490000
-				max_events:   null
 				timeout_secs: 1
 			}
 			compression: enabled: false
@@ -54,14 +54,15 @@ components: sinks: logdna: {
 
 	support: {
 		targets: {
-			"aarch64-unknown-linux-gnu":  true
-			"aarch64-unknown-linux-musl": true
-			"x86_64-apple-darwin":        true
-			"x86_64-pc-windows-msv":      true
-			"x86_64-unknown-linux-gnu":   true
-			"x86_64-unknown-linux-musl":  true
+			"aarch64-unknown-linux-gnu":      true
+			"aarch64-unknown-linux-musl":     true
+			"armv7-unknown-linux-gnueabihf":  true
+			"armv7-unknown-linux-musleabihf": true
+			"x86_64-apple-darwin":            true
+			"x86_64-pc-windows-msv":          true
+			"x86_64-unknown-linux-gnu":       true
+			"x86_64-unknown-linux-musl":      true
 		}
-
 		requirements: []
 		warnings: []
 		notices: []
@@ -74,6 +75,7 @@ components: sinks: logdna: {
 			warnings: []
 			type: string: {
 				examples: ["${LOGDNA_API_KEY}", "ef8d5de700e7989468166c40fc8a0ccd"]
+				syntax: "literal"
 			}
 		}
 		default_app: {
@@ -84,6 +86,7 @@ components: sinks: logdna: {
 			type: string: {
 				default: "vector"
 				examples: ["vector", "myapp"]
+				syntax: "literal"
 			}
 		}
 		default_env: {
@@ -94,6 +97,7 @@ components: sinks: logdna: {
 			type: string: {
 				default: "production"
 				examples: ["staging", "production"]
+				syntax: "literal"
 			}
 		}
 		endpoint: {
@@ -103,6 +107,7 @@ components: sinks: logdna: {
 			type: string: {
 				default: "https://logs.logdna.com/logs/ingest"
 				examples: ["http://127.0.0.1", "http://example.com"]
+				syntax: "literal"
 			}
 		}
 		hostname: {
@@ -111,6 +116,7 @@ components: sinks: logdna: {
 			warnings: []
 			type: string: {
 				examples: ["${HOSTNAME}", "my-local-machine"]
+				syntax: "literal"
 			}
 		}
 		ip: {
@@ -121,6 +127,7 @@ components: sinks: logdna: {
 			type: string: {
 				default: null
 				examples: ["0.0.0.0"]
+				syntax: "literal"
 			}
 		}
 		mac: {
@@ -131,6 +138,7 @@ components: sinks: logdna: {
 			type: string: {
 				default: null
 				examples: ["my-mac-address"]
+				syntax: "literal"
 			}
 		}
 		tags: {
@@ -140,7 +148,10 @@ components: sinks: logdna: {
 			warnings: []
 			type: array: {
 				default: null
-				items: type: string: examples: ["tag1", "tag2"]
+				items: type: string: {
+					examples: ["tag1", "tag2"]
+					syntax: "literal"
+				}
 			}
 		}
 	}
@@ -148,5 +159,10 @@ components: sinks: logdna: {
 	input: {
 		logs:    true
 		metrics: null
+	}
+
+	telemetry: metrics: {
+		events_discarded_total:  components.sources.internal_metrics.output.metrics.events_discarded_total
+		processing_errors_total: components.sources.internal_metrics.output.metrics.processing_errors_total
 	}
 }

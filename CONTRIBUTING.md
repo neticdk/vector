@@ -18,7 +18,6 @@ expanding into more specifics.
    1. [Github Pull Requests](#github-pull-requests)
       1. [Title](#title)
       1. [Reviews & Approvals](#reviews--approvals)
-      1. [Bors review process](#bors-review-process)
       1. [Merge Style](#merge-style)
    1. [CI](#ci)
       1. [Releasing](#releasing)
@@ -60,8 +59,15 @@ expanding into more specifics.
       1. [Kubernetes E2E tests](#kubernetes-e2e-tests)
          1. [Requirements](#requirements-1)
          1. [Running the E2E tests](#running-the-e2e-tests)
+      1. [Kubernetes Architecture](#kubernetes-architecture)
+         1. [The operation logic](#the-operation-logic)
+         1. [Where to find things](#where-to-find-things)
 1. [Humans](#humans)
    1. [Documentation](#documentation)
+      1. [How the docs work](#how-the-docs-work)
+      1. [Formatting](#formatting)
+      1. [Validation](#validation)
+      1. [Development flow](#development-flow)
    1. [Changelog](#changelog)
       1. [What makes a highlight noteworthy?](#what-makes-a-highlight-noteworthy)
       1. [How is a highlight different from a blog post?](#how-is-a-highlight-different-from-a-blog-post)
@@ -92,14 +98,14 @@ expanding into more specifics.
    [existing issue][urls.existing_issues] or [open a new issue][urls.new_issue].
    - This is where you can get a feel if the change will be accepted or not.
      Changes that are questionable will have a `needs: approval` label.
-2. One approved, [fork the Vector repository][urls.fork_repo] in your own
+2. Once approved, [fork the Vector repository][urls.fork_repo] in your own
    Github account.
 3. [Create a new Git branch][urls.create_branch].
-4. Review the Vector [workflow](#workflow) and [development](#development).
+4. Review the Vector [change control](#change-control) and [development](#development) workflows.
 5. Make your changes.
 6. [Submit the branch as a pull request][urls.submit_pr] to the main Vector
    repo. A Vector team member should comment and/or review your pull request
-   with a few days. Although, depending on the circumstances, it may take
+   within a few days. Although, depending on the circumstances, it may take
    longer.
 
 ### New sources, sinks, and transforms
@@ -190,34 +196,6 @@ All pull requests should be reviewed by:
 If there are any CODEOWNERs automatically assigned, you should also wait for
 their review.
 
-#### Bors review process
-
-[![Bors enabled](https://bors.tech/images/badge_small.svg)](https://app.bors.tech/repositories/28346)
-
-Once you’ve reviewed the PR, instead of clicking the green “Merge Button”, leave a comment like this on the pull request:
-
-```text
-bors r+
-```
-
-Equivalently, you can comment the following:
-
-```text
-bors merge
-```
-
-The pull request, as well as any other pull requests that are reviewed around the same time, will be merged into a branch called `staging`. CI will run there and report the result back. If that result is “OK”, `master` gets fast-forwarded to reach it.
-
-There’s also:
-
-```text
-bors try
-```
-
-When this is run, your branch and master get merged into `trying`, and bors will report the results just like the `staging` branch would. Only reviewers can push to this.
-
-The review process is outlined in the [Review guide](REVIEWING.md).
-
 #### Merge Style
 
 All pull requests are squashed and merged. We generally discourage large pull
@@ -293,7 +271,7 @@ Since not everyone has a full working native environment, we took our environmen
 
 This is ideal for users who want it to "Just work" and just want to start contributing. It's also what we use for our CI, so you know if it breaks we can't do anything else until we fix it. 😉
 
-**Before you go farther, install Docker or Podman through your official package manager, or from the [Docker](https://docs.docker.com/get-docker/) or [Podman](https://podman.io/) sites.**
+**Before you go further, install Docker or Podman through your official package manager, or from the [Docker](https://docs.docker.com/get-docker/) or [Podman](https://podman.io/) sites.**
 
 ```bash
 # Optional: Only if you use `podman`
@@ -352,9 +330,9 @@ We use explicit environment opt-in as many contributors choose to keep their Rus
 
 To build Vector on your own host will require a fairly complete development environment!
 
-We keep an up to date list of all dependencies used in our CI environment inside our `default.nix` file. Loosely, you'll need the following:
+Loosely, you'll need the following:
 
-- **To build Vector:** Have working Rustup, Protobuf tools, C++/C build tools (LLVM, GCC, or MSVC), Python, and Perl, `make` (the GNU one preferably), `bash`, `cmake`, and `autotools`. (Full list in [`scripts/environment/definition.nix`](./scripts/environment/definition.nix).
+- **To build Vector:** Have working Rustup, Protobuf tools, C++/C build tools (LLVM, GCC, or MSVC), Python, and Perl, `make` (the GNU one preferably), `bash`, `cmake`, and `autotools`.
 - **To run integration tests:** Have `docker` available, or a real live version of that service. (Use `AUTOSPAWN=false`)
 - **To run `make check-component-features`:** Have `remarshal` installed.
 
@@ -398,10 +376,10 @@ If you run `make` you'll see a full list of all our tasks. Some of these will st
 
 #### Directory Structure
 
-- [`/.meta`](/.meta) - Project metadata used to generate documentation.
 - [`/benches`](/benches) - Internal benchmarks.
 - [`/config`](/config) - Public facing Vector config, included in releases.
 - [`/distribution`](/distribution) - Distribution artifacts for various targets.
+- [`/docs`](/docs) - Structured data used to generate documentation.
 - [`/lib`](/lib) - External libraries that do not depend on `vector` but are used within the project.
 - [`/proto`](/proto) - Protobuf definitions.
 - [`/scripts`](/scripts) - Scripts used to generate docs and maintain the repo.
@@ -448,7 +426,7 @@ warn!("Failed to merge value: {}.", err);
 Yep!
 
 ```rust
-warn!(message = "Failed to merge value.", error = ?error);
+warn!(message = "Failed to merge value.", %error);
 ```
 
 #### Feature flags
@@ -841,6 +819,8 @@ E2E (end-to-end) tests.
 - `docker`
 - `kubectl`
 - `bash`
+- `cross` - `cargo install cross`
+- [`helm`](https://helm.sh/)
 
 Vector release artifacts are prepared for E2E tests, so the ability to do that
 is required too, see Vector [docs](https://vector.dev) for more details.
@@ -898,6 +878,9 @@ You can also pass additional parameters to adjust the behavior of the test:
 - `SCOPE` - pass a filter to the `cargo test` command to filter out the tests,
   effectively equivalent to `cargo test -- $SCOPE`.
 
+- `NAMESPACE` - specifies the k8s namespace to run the tests in. Some tests are
+  run in another namespace with this one prepended: `<NAMESPACE>-test-pod`.
+
 Passing additional commands is done like so:
 
 ```shell
@@ -910,6 +893,42 @@ or
 QUICK_BUILD=true CONTAINER_IMAGE_REPO=<your name>/vector-test make test-e2e-kubernetes
 ```
 
+#### Kubernetes Architecture
+
+Kubernetes integration architecture is largely inspired by
+the [RFC 2221](rfcs/2020-04-04-2221-kubernetes-integration.md), so this
+is a concise outline of the effective design, rather than a deep dive into
+the concepts.
+
+##### The operation logic
+
+With `kubernetes_logs` source, Vector connects to the Kubernetes API doing
+a streaming watch request over the `Pod`s executing on the same `Node` that
+Vector itself runs at. Once Vector gets the list of all the `Pod`s that are
+running on the `Node`, it starts collecting logs for the logs files
+corresponding to each of the `Pod`. Only plaintext (as in non-gzipped) files
+are taken into consideration.
+The log files are then parsed into events, and the said events are annotated
+with the metadata from the corresponding `Pod`s, correlated via the file path
+of the originating log file.
+The events are then passed to the topology.
+
+##### Where to find things
+
+We use custom Kubernetes API client and machinery, that lives
+at `src/kubernetes`.
+The `kubernetes_logs` source lives at `src/sources/kubernetes_logs`.
+There is also an end-to-end (E2E) test framework that resides
+at `lib/k8s-test-framework`, and the actual end-to-end tests using that
+framework are at `lib/k8s-e2e-tests`.
+
+The Kubernetes-related distribution bit that are at `distribution/docker`,
+`distribution/kubernetes` and `distribution/helm`.
+There are also snapshot tests for Helm at `tests/helm-snapshots`.
+
+The development assistance resources are located at `skaffold.yaml`
+and `skaffold` dir.
+
 ## Humans
 
 After making your change, you'll want to prepare it for Vector's users
@@ -918,9 +937,59 @@ your feature.
 
 ### Documentation
 
-Documentation is very important to the Vector project! All documentation is
-located in the `/docs` folder. To ensure your change is valid, you can run
-`make check-docs`, which validates your changes to the `/docs` directory.
+Documentation is very important to the Vector project! The official
+docs at https://vector.dev/docs are built using structured data written in
+[CUE], a language designed for data templating and validation. All of Vector's
+CUE sources are in the `/docs` folder.
+
+> Vector is currently using CUE version **0.3.2**. Be sure to use
+> precisely this version, as CUE is evolving quickly and you can expect breaking
+> changes in each release.
+
+#### How the docs work
+
+When the HTML output for the Vector docs is built, the `vector` repo is cloned
+(in another repo) and these CUE sources are converted into one big JSON object
+using the `cue export` command. That JSON is then used as an input to the site
+build.
+
+#### Formatting
+
+Vector has some CUE-related CI checks that are run whenever changes are made to
+the `docs` directory. This includes checks to make sure that the CUE sources are
+properly formatted. To run CUE's autoformatting, run this command from the
+`vector` root:
+
+```bash
+cue fmt ./docs/**/*.cue
+```
+
+If that rewrites any files, make sure to commit your changes or else you'll see
+CI failures.
+
+#### Validation
+
+In addition to proper formatting, the CUE sources need to be *valid*, that is,
+the provided data needs to conform to various CUE schemas. To check the validity
+of the CUE sources:
+
+```bash
+make check-docs
+```
+
+#### Development flow
+
+A good practice for writing CUE is to make small, incremental changes and to
+frequently check to ensure that those changes are valid. If you introduce larger
+changes that introduce multiple errors, you may have difficulty interpreting
+CUE's verbose (and not always super helpful) log output. In fact, we recommend
+using a tool like [watchexec] to validate the sources every time you save a
+change:
+
+```bash
+# From the root
+watchexec "make check-docs"
+```
 
 ### Changelog
 
@@ -941,11 +1010,9 @@ Highlights are not blog posts. They are short one, maybe two, paragraph
 announcements. Highlights should allude to, or link to, a blog post if
 relevant.
 
-For example, [this performance increase announcement][urls.performance_highlight]
+For example, [this adaptive concurrency announcement][urls.adaptive_concurrency]
 is noteworthy, but also deserves an in-depth blog post covering the work that
-resulted in the performance benefit. Notice that the highlight alludes to an
-upcoming blog post. This allows us to communicate a high-value performance
-improvement without being blocked by an in-depth blog post.
+resulted in the performance and reliability benefit.
 
 ## Security
 
@@ -1011,11 +1078,13 @@ contact us at vector@timber.io.
 
 [urls.aws_announcements]: https://aws.amazon.com/new/?whats-new-content-all.sort-by=item.additionalFields.postDateTime&whats-new-content-all.sort-order=desc&wn-featured-announcements.sort-by=item.additionalFields.numericSort&wn-featured-announcements.sort-order=asc
 [urls.create_branch]: https://help.github.com/en/github/collaborating-with-issues-and-pull-requests/creating-and-deleting-branches-within-your-repository
+[urls.cue]: https://cuelang.org
 [urls.existing_issues]: https://github.com/timberio/vector/issues
 [urls.fork_repo]: https://help.github.com/en/github/getting-started-with-github/fork-a-repo
 [urls.github_sign_commits]: https://help.github.com/en/github/authenticating-to-github/signing-commits
 [urls.new_issue]: https://github.com/timberio/vector/issues/new
 [urls.push_it_to_the_limit]: https://www.youtube.com/watch?v=ueRzA9GUj9c
-[urls.performance_highlight]: https://vector.dev/highlights/2020-04-11-overall-performance-increase
+[urls.adaptive_concurrency]: https://vector.dev/highlights/2020-09-18-adaptive-concurrency
 [urls.submit_pr]: https://help.github.com/en/github/collaborating-with-issues-and-pull-requests/creating-a-pull-request-from-a-fork
 [urls.vector_test_harness]: https://github.com/timberio/vector-test-harness/
+[urls.watchexec]: https://github.com/watchexec/watchexec

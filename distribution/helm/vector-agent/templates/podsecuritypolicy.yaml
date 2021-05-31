@@ -12,15 +12,26 @@ spec:
   volumes:
     - 'hostPath'
     - 'configMap'
+    - 'emptyDir'
     - 'secret'
     - 'projected'
   allowedHostPaths:
     - pathPrefix: "/var/log"
       readOnly: true
     - pathPrefix: "/var/lib"
+<<<<<<< HEAD
       readOnly: true
     - pathPrefix: "/var/lib/vector"
       readOnly: false
+=======
+      readOnly: true
+    - pathPrefix: "/var/lib/vector"
+      readOnly: false
+    - pathPrefix: "/sys"
+      readOnly: true
+    - pathPrefix: "/proc"
+      readOnly: true
+>>>>>>> upstream/master
     {{- range .Values.extraVolumes }}
     {{- if .hostPath }}
     - pathPrefix: {{ .hostPath.path }}

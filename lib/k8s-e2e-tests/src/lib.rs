@@ -3,10 +3,31 @@ use k8s_openapi::{
     apimachinery::pkg::apis::meta::v1::ObjectMeta,
 };
 use k8s_test_framework::{Framework, Interface, Reader};
+use std::env;
 
 pub mod metrics;
 
 pub const BUSYBOX_IMAGE: &str = "busybox:1.28";
+
+pub fn get_namespace() -> String {
+    env::var("NAMESPACE").unwrap_or_else(|_| "test-vector".to_string())
+}
+
+pub fn get_namespace_appended(suffix: &str) -> String {
+    format!("{}-{}", get_namespace(), suffix)
+}
+
+/// Gets a name we can use for roles to prevent them conflicting with other tests.
+/// Uses the provided namespace as the root.
+pub fn get_override_name(suffix: &str) -> String {
+    format!("{}-{}", get_namespace(), suffix)
+}
+
+/// Adds a fullnameOverride entry to the given config. This allows multiple tests
+/// to be run against the same cluster without the role anmes clashing.
+pub fn config_override_name(config: &str, name: &str) -> String {
+    format!("fullnameOverride: \"{}\"\n{}", name, config)
+}
 
 pub fn make_framework() -> Framework {
     let interface = Interface::from_env().expect("interface is not ready");
@@ -76,8 +97,8 @@ pub fn make_test_pod<'a>(
     )
 }
 
-pub fn parse_json(s: &str) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-    Ok(serde_json::from_str(s)?)
+pub fn parse_json(s: &str) -> Result<serde_json::Value, serde_json::Error> {
+    serde_json::from_str(s)
 }
 
 pub fn generate_long_string(a: usize, b: usize) -> String {
@@ -127,7 +148,7 @@ where
         lines_till_we_give_up -= 1;
         if lines_till_we_give_up <= 0 {
             println!("Giving up");
-            log_reader.kill()?;
+            log_reader.kill().await?;
             break;
         }
 
@@ -136,7 +157,17 @@ where
             continue;
         }
 
-        let val = parse_json(&line)?;
+        let val = match parse_json(&line) {
+            Ok(val) => val,
+            Err(err) if err.is_eof() => {
+                // We got an EOF error, this is most likely some very long line,
+                // we don't produce lines this bing is our test cases, so we'll
+                // just skip the error - as if it wasn't a JSON string.
+                println!("The JSON line we just got was incomplete, most likely it was was too long, so we're skipping it");
+                continue;
+            }
+            Err(err) => return Err(err.into()),
+        };
 
         match predicate(val) {
             FlowControlCommand::GoOn => {
@@ -147,7 +178,7 @@ where
                 // killed.
                 // This doesn't immediately stop the reading because we want to
                 // process the pending buffers first.
-                log_reader.kill()?;
+                log_reader.kill().await?;
             }
         }
     }

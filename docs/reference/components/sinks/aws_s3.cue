@@ -9,6 +9,7 @@ components: sinks: aws_s3: components._aws & {
 		development:   "stable"
 		egress_method: "batch"
 		service_providers: ["AWS"]
+		stateful: false
 	}
 
 	features: {
@@ -19,7 +20,6 @@ components: sinks: aws_s3: components._aws & {
 				enabled:      true
 				common:       true
 				max_bytes:    10000000
-				max_events:   null
 				timeout_secs: 300
 			}
 			compression: {
@@ -67,14 +67,15 @@ components: sinks: aws_s3: components._aws & {
 
 	support: {
 		targets: {
-			"aarch64-unknown-linux-gnu":  true
-			"aarch64-unknown-linux-musl": true
-			"x86_64-apple-darwin":        true
-			"x86_64-pc-windows-msv":      true
-			"x86_64-unknown-linux-gnu":   true
-			"x86_64-unknown-linux-musl":  true
+			"aarch64-unknown-linux-gnu":      true
+			"aarch64-unknown-linux-musl":     true
+			"armv7-unknown-linux-gnueabihf":  true
+			"armv7-unknown-linux-musleabihf": true
+			"x86_64-apple-darwin":            true
+			"x86_64-pc-windows-msv":          true
+			"x86_64-unknown-linux-gnu":       true
+			"x86_64-unknown-linux-musl":      true
 		}
-
 		requirements: []
 		warnings: []
 		notices: []
@@ -90,13 +91,16 @@ components: sinks: aws_s3: components._aws & {
 			type: string: {
 				default: null
 				enum: {
-					"private":            "Owner gets FULL_CONTROL. No one else has access rights (default)."
-					"public-read":        "Owner gets FULL_CONTROL. The AllUsers group gets READ access."
-					"public-read-write":  "Owner gets FULL_CONTROL. The AllUsers group gets READ and WRITE access. Granting this on a bucket is generally not recommended."
-					"aws-exec-read":      "Owner gets FULL_CONTROL. Amazon EC2 gets READ access to GET an Amazon Machine Image (AMI) bundle from Amazon S3."
-					"authenticated-read": "Owner gets FULL_CONTROL. The AuthenticatedUsers group gets READ access."
-					"log-delivery-write": "The LogDelivery group gets WRITE and READ_ACP permissions on the bucket. For more information about logs, see [Amazon S3 Server Access Logging](https://docs.aws.amazon.com/AmazonS3/latest/dev/ServerLogs.html)."
+					"private":                   "Owner gets `FULL_CONTROL`. No one else has access rights (default)."
+					"public-read":               "Owner gets `FULL_CONTROL`. The AllUsers group gets `READ` access."
+					"public-read-write":         "Owner gets `FULL_CONTROL`. The AllUsers group gets `READ` and `WRITE` access. Granting this on a bucket is generally not recommended."
+					"aws-exec-read":             "Owner gets `FULL_CONTROL`. Amazon EC2 gets `READ` access to `GET` an Amazon Machine Image (AMI) bundle from Amazon S3."
+					"authenticated-read":        "Owner gets `FULL_CONTROL`. The AuthenticatedUsers group gets `READ` access."
+					"bucket-owner-read":         "Object owner gets `FULL_CONTROL`. Bucket owner gets `READ. access."
+					"bucket-owner-full-control": "Both the object owner and the bucket owner get `FULL_CONTROL` over the object."
+					"log-delivery-write":        "The LogDelivery group gets `WRITE` and `READ_ACP` permissions on the bucket. For more information about logs, see [Amazon S3 Server Access Logging](\(urls.aws_s3_server_access_logs))."
 				}
+				syntax: "literal"
 			}
 		}
 		bucket: {
@@ -105,6 +109,7 @@ components: sinks: aws_s3: components._aws & {
 			warnings: []
 			type: string: {
 				examples: ["my-bucket"]
+				syntax: "literal"
 			}
 		}
 		content_encoding: {
@@ -116,6 +121,7 @@ components: sinks: aws_s3: components._aws & {
 			type: string: {
 				default: null
 				examples: ["gzip"]
+				syntax: "literal"
 			}
 		}
 		content_type: {
@@ -126,6 +132,7 @@ components: sinks: aws_s3: components._aws & {
 			warnings: []
 			type: string: {
 				default: "text/x-log"
+				syntax:  "literal"
 			}
 		}
 		filename_append_uuid: {
@@ -144,6 +151,7 @@ components: sinks: aws_s3: components._aws & {
 			warnings: []
 			type: string: {
 				default: "log"
+				syntax:  "literal"
 			}
 		}
 		filename_time_format: {
@@ -154,6 +162,7 @@ components: sinks: aws_s3: components._aws & {
 			warnings: []
 			type: string: {
 				default: "%s"
+				syntax:  "strftime"
 			}
 		}
 		grant_full_control: {
@@ -165,6 +174,7 @@ components: sinks: aws_s3: components._aws & {
 			type: string: {
 				default: null
 				examples: ["79a59df900b949e55d96a1e698fbacedfd6e09d98eacf8f8d5218e7cd47ef2be", "person@email.com", "http://acs.amazonaws.com/groups/global/AllUsers"]
+				syntax: "literal"
 			}
 		}
 		grant_read: {
@@ -176,6 +186,7 @@ components: sinks: aws_s3: components._aws & {
 			type: string: {
 				default: null
 				examples: ["79a59df900b949e55d96a1e698fbacedfd6e09d98eacf8f8d5218e7cd47ef2be", "person@email.com", "http://acs.amazonaws.com/groups/global/AllUsers"]
+				syntax: "literal"
 			}
 		}
 		grant_read_acp: {
@@ -187,6 +198,7 @@ components: sinks: aws_s3: components._aws & {
 			type: string: {
 				default: null
 				examples: ["79a59df900b949e55d96a1e698fbacedfd6e09d98eacf8f8d5218e7cd47ef2be", "person@email.com", "http://acs.amazonaws.com/groups/global/AllUsers"]
+				syntax: "literal"
 			}
 		}
 		grant_write_acp: {
@@ -198,6 +210,7 @@ components: sinks: aws_s3: components._aws & {
 			type: string: {
 				default: null
 				examples: ["79a59df900b949e55d96a1e698fbacedfd6e09d98eacf8f8d5218e7cd47ef2be", "person@email.com", "http://acs.amazonaws.com/groups/global/AllUsers"]
+				syntax: "literal"
 			}
 		}
 		key_prefix: {
@@ -209,7 +222,7 @@ components: sinks: aws_s3: components._aws & {
 			type: string: {
 				default: "date=%F/"
 				examples: ["date=%F/", "date=%F/hour=%H/", "year=%Y/month=%m/day=%d/", "application_id={{ application_id }}/date=%F/"]
-				templateable: true
+				syntax: "template"
 			}
 		}
 		server_side_encryption: {
@@ -224,6 +237,7 @@ components: sinks: aws_s3: components._aws & {
 					"AES256":  "256-bit Advanced Encryption Standard"
 					"aws:kms": "AWS managed key encryption"
 				}
+				syntax: "literal"
 			}
 		}
 		ssekms_key_id: {
@@ -235,6 +249,7 @@ components: sinks: aws_s3: components._aws & {
 			type: string: {
 				default: null
 				examples: ["abcd1234"]
+				syntax: "literal"
 			}
 		}
 		storage_class: {
@@ -254,6 +269,7 @@ components: sinks: aws_s3: components._aws & {
 					GLACIER:             "Use for archives where portions of the data might need to be retrieved in minutes."
 					DEEP_ARCHIVE:        "Use for archiving data that rarely needs to be accessed."
 				}
+				syntax: "literal"
 			}
 		}
 		tags: {
@@ -377,7 +393,7 @@ components: sinks: aws_s3: components._aws & {
 				AWS S3 offers [server-side encryption](\(urls.aws_s3_sse)). You can apply defaults
 				at the bucket level or set the encryption at the object level. In the context,
 				of Vector only the object level is relevant (Vector does not create or modify
-				buckets). Although, we recommend setting defaults at the bucket level whne
+				buckets). Although, we recommend setting defaults at the bucket level when
 				possible. You can explicitly set the object level encryption via the
 				`server_side_encryption` option.
 				"""
@@ -416,4 +432,9 @@ components: sinks: aws_s3: components._aws & {
 			]
 		},
 	]
+
+	telemetry: metrics: {
+		events_discarded_total:  components.sources.internal_metrics.output.metrics.events_discarded_total
+		processing_errors_total: components.sources.internal_metrics.output.metrics.processing_errors_total
+	}
 }

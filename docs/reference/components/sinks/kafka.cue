@@ -9,6 +9,7 @@ components: sinks: kafka: {
 		development:   "stable"
 		egress_method: "dynamic"
 		service_providers: ["AWS", "Confluent"]
+		stateful: false
 	}
 
 	features: {
@@ -18,8 +19,8 @@ components: sinks: kafka: {
 			batch: {
 				enabled:      true
 				common:       true
-				max_bytes:    null
 				max_events:   null
+				max_bytes:    null
 				timeout_secs: null
 			}
 			compression: {
@@ -58,6 +59,7 @@ components: sinks: kafka: {
 			warnings: []
 			type: string: {
 				examples: ["user_id"]
+				syntax: "literal"
 			}
 		}
 		librdkafka_options: components._kafka.configuration.librdkafka_options
@@ -95,6 +97,7 @@ components: sinks: kafka: {
 						type: string: {
 							default: null
 							examples: ["SCRAM-SHA-256", "SCRAM-SHA-512"]
+							syntax: "literal"
 						}
 					}
 					password: {
@@ -105,6 +108,7 @@ components: sinks: kafka: {
 						type: string: {
 							default: null
 							examples: ["password"]
+							syntax: "literal"
 						}
 					}
 					username: {
@@ -115,6 +119,7 @@ components: sinks: kafka: {
 						type: string: {
 							default: null
 							examples: ["username"]
+							syntax: "literal"
 						}
 					}
 				}
@@ -127,6 +132,7 @@ components: sinks: kafka: {
 			warnings: []
 			type: string: {
 				examples: ["topic-1234", "logs-{{unit}}-%Y-%m-%d"]
+				syntax: "literal"
 			}
 		}
 	}
@@ -144,4 +150,19 @@ components: sinks: kafka: {
 	}
 
 	how_it_works: components._kafka.how_it_works
+
+	telemetry: metrics: {
+		events_discarded_total:              components.sources.internal_metrics.output.metrics.events_discarded_total
+		processing_errors_total:             components.sources.internal_metrics.output.metrics.processing_errors_total
+		kafka_queue_messages:                components.sources.internal_metrics.output.metrics.kafka_queue_messages
+		kafka_queue_messages_bytes:          components.sources.internal_metrics.output.metrics.kafka_queue_messages_bytes
+		kafka_requests_total:                components.sources.internal_metrics.output.metrics.kafka_requests_total
+		kafka_requests_bytes_total:          components.sources.internal_metrics.output.metrics.kafka_requests_bytes_total
+		kafka_responses_total:               components.sources.internal_metrics.output.metrics.kafka_responses_total
+		kafka_responses_bytes_total:         components.sources.internal_metrics.output.metrics.kafka_responses_bytes_total
+		kafka_produced_messages_total:       components.sources.internal_metrics.output.metrics.kafka_produced_messages_total
+		kafka_produced_messages_bytes_total: components.sources.internal_metrics.output.metrics.kafka_produced_messages_bytes_total
+		kafka_consumed_messages_total:       components.sources.internal_metrics.output.metrics.kafka_consumed_messages_total
+		kafka_consumed_messages_bytes_total: components.sources.internal_metrics.output.metrics.kafka_consumed_messages_bytes_total
+	}
 }

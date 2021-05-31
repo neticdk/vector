@@ -9,8 +9,12 @@ pub mod aws_ecs_metrics;
 pub mod aws_kinesis_firehose;
 #[cfg(feature = "sources-aws_s3")]
 pub mod aws_s3;
+#[cfg(feature = "sources-datadog")]
+pub mod datadog;
 #[cfg(feature = "sources-docker_logs")]
 pub mod docker_logs;
+#[cfg(feature = "sources-exec")]
+pub mod exec;
 #[cfg(feature = "sources-file")]
 pub mod file;
 #[cfg(feature = "sources-generator")]
@@ -35,6 +39,8 @@ pub mod kubernetes_logs;
 pub mod mongodb_metrics;
 #[cfg(feature = "sources-nginx_metrics")]
 pub mod nginx_metrics;
+#[cfg(feature = "sources-postgresql_metrics")]
+pub mod postgresql_metrics;
 #[cfg(feature = "sources-prometheus")]
 pub mod prometheus;
 #[cfg(feature = "sources-socket")]

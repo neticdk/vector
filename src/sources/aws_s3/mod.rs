@@ -1,10 +1,8 @@
 use super::util::MultilineConfig;
 use crate::{
-    config::{DataType, GlobalOptions, SourceConfig, SourceDescription},
+    config::{DataType, SourceConfig, SourceContext, SourceDescription},
     line_agg,
-    rusoto::{self, RegionOrEndpoint},
-    shutdown::ShutdownSignal,
-    Pipeline,
+    rusoto::{self, AwsAuthentication, RegionOrEndpoint},
 };
 use rusoto_core::Region;
 use rusoto_s3::S3Client;
@@ -46,7 +44,10 @@ struct AwsS3Config {
 
     sqs: Option<sqs::Config>,
 
+    // Deprecated name. Moved to auth.
     assume_role: Option<String>,
+    #[serde(default)]
+    auth: AwsAuthentication,
 
     multiline: Option<MultilineConfig>,
 }
@@ -60,13 +61,7 @@ impl_generate_config_from_default!(AwsS3Config);
 #[async_trait::async_trait]
 #[typetag::serde(name = "aws_s3")]
 impl SourceConfig for AwsS3Config {
-    async fn build(
-        &self,
-        _name: &str,
-        _globals: &GlobalOptions,
-        shutdown: ShutdownSignal,
-        out: Pipeline,
-    ) -> crate::Result<super::Source> {
+    async fn build(&self, cx: SourceContext) -> crate::Result<super::Source> {
         let multiline_config: Option<line_agg::Config> = self
             .multiline
             .as_ref()
@@ -77,7 +72,7 @@ impl SourceConfig for AwsS3Config {
             Strategy::Sqs => Ok(Box::pin(
                 self.create_sqs_ingestor(multiline_config)
                     .await?
-                    .run(out, shutdown),
+                    .run(cx.out, cx.shutdown),
             )),
         }
     }
@@ -101,10 +96,11 @@ impl AwsS3Config {
         let region: Region = (&self.region).try_into().context(RegionParse {})?;
 
         let client = rusoto::client().with_context(|| Client {})?;
-        let creds: Arc<rusoto::AwsCredentialsProvider> =
-            rusoto::AwsCredentialsProvider::new(&region, self.assume_role.clone())
-                .context(Credentials {})?
-                .into();
+        let creds: Arc<rusoto::AwsCredentialsProvider> = self
+            .auth
+            .build(&region, self.assume_role.clone())
+            .context(Credentials {})?
+            .into();
         let s3_client = S3Client::new_with(
             client.clone(),
             Arc::<rusoto::AwsCredentialsProvider>::clone(&creds),
@@ -156,7 +152,7 @@ fn s3_object_decoder(
     content_type: Option<&str>,
     body: rusoto_s3::StreamingBody,
 ) -> Box<dyn tokio::io::AsyncRead + Send + Unpin> {
-    use async_compression::tokio_02::bufread;
+    use async_compression::tokio::bufread;
 
     let r = tokio::io::BufReader::new(body.into_async_read());
 
@@ -171,8 +167,16 @@ fn s3_object_decoder(
     match compression {
         Auto => unreachable!(), // is mapped above
         None => Box::new(r),
-        Gzip => Box::new(bufread::GzipDecoder::new(r)),
-        Zstd => Box::new(bufread::ZstdDecoder::new(r)),
+        Gzip => Box::new({
+            let mut decoder = bufread::GzipDecoder::new(r);
+            decoder.multiple_members(true);
+            decoder
+        }),
+        Zstd => Box::new({
+            let mut decoder = bufread::ZstdDecoder::new(r);
+            decoder.multiple_members(true);
+            decoder
+        }),
     }
 }
 
@@ -257,12 +261,11 @@ mod test {
 mod integration_tests {
     use super::{sqs, AwsS3Config, Compression, Strategy};
     use crate::{
-        config::{GlobalOptions, SourceConfig},
+        config::{SourceConfig, SourceContext},
         line_agg,
         rusoto::RegionOrEndpoint,
-        shutdown::ShutdownSignal,
         sources::util::MultilineConfig,
-        test_util::{collect_n, random_lines},
+        test_util::{collect_n, lines_from_gzip_file, lines_from_zst_file, random_lines},
         Pipeline,
     };
     use pretty_assertions::assert_eq;
@@ -273,6 +276,14 @@ mod integration_tests {
     #[tokio::test]
     async fn s3_process_message() {
         let key = uuid::Uuid::new_v4().to_string();
+        let logs: Vec<String> = random_lines(100).take(10).collect();
+
+        test_event(key, None, None, None, logs.join("\n").into_bytes(), logs).await;
+    }
+
+    #[tokio::test]
+    async fn s3_process_message_special_characters() {
+        let key = format!("special:{}", uuid::Uuid::new_v4().to_string());
         let logs: Vec<String> = random_lines(100).take(10).collect();
 
         test_event(key, None, None, None, logs.join("\n").into_bytes(), logs).await;
@@ -293,6 +304,42 @@ mod integration_tests {
         gz.read_to_end(&mut buffer).unwrap();
 
         test_event(key, Some("gzip"), None, None, buffer, logs).await;
+    }
+
+    #[tokio::test]
+    async fn s3_process_message_multipart_gzip() {
+        use std::io::Read;
+
+        let key = uuid::Uuid::new_v4().to_string();
+        let logs = lines_from_gzip_file("tests/data/multipart-gzip.log.gz");
+
+        let buffer = {
+            let mut file = std::fs::File::open("tests/data/multipart-gzip.log.gz")
+                .expect("file can be opened");
+            let mut data = Vec::new();
+            file.read_to_end(&mut data).expect("file can be read");
+            data
+        };
+
+        test_event(key, Some("gzip"), None, None, buffer, logs).await;
+    }
+
+    #[tokio::test]
+    async fn s3_process_message_multipart_zstd() {
+        use std::io::Read;
+
+        let key = uuid::Uuid::new_v4().to_string();
+        let logs = lines_from_zst_file("tests/data/multipart-zst.log.zst");
+
+        let buffer = {
+            let mut file = std::fs::File::open("tests/data/multipart-zst.log.zst")
+                .expect("file can be opened");
+            let mut data = Vec::new();
+            file.read_to_end(&mut data).expect("file can be read");
+            data
+        };
+
+        test_event(key, Some("zstd"), None, None, buffer, logs).await;
     }
 
     #[tokio::test]
@@ -365,12 +412,7 @@ mod integration_tests {
         let (tx, rx) = Pipeline::new_test();
         tokio::spawn(async move {
             config
-                .build(
-                    "default",
-                    &GlobalOptions::default(),
-                    ShutdownSignal::noop(),
-                    tx,
-                )
+                .build(SourceContext::new_test(tx))
                 .await
                 .unwrap()
                 .await
@@ -432,6 +474,7 @@ mod integration_tests {
         client
             .put_bucket_notification_configuration(PutBucketNotificationConfigurationRequest {
                 bucket: bucket_name.clone(),
+                expected_bucket_owner: None,
                 notification_configuration: NotificationConfiguration {
                     queue_configurations: Some(vec![QueueConfiguration {
                         events: vec!["s3:ObjectCreated:*".to_string()],

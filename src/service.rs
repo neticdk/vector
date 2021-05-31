@@ -27,20 +27,20 @@ struct InstallOpts {
     display_name: Option<String>,
 
     /// Vector config files in TOML format to be used by the service.
-    #[structopt(name = "config-toml", long)]
+    #[structopt(name = "config-toml", long, use_delimiter(true))]
     config_paths_toml: Vec<PathBuf>,
 
     /// Vector config files in JSON format to be used by the service.
-    #[structopt(name = "config-json", long)]
+    #[structopt(name = "config-json", long, use_delimiter(true))]
     config_paths_json: Vec<PathBuf>,
 
     /// Vector config files in YAML format to be used by the service.
-    #[structopt(name = "config-yaml", long)]
+    #[structopt(name = "config-yaml", long, use_delimiter(true))]
     config_paths_yaml: Vec<PathBuf>,
 
     /// The configuration files that will be used by the service.
     /// If no configuration file is specified, will target default configuration file.
-    #[structopt(name = "config", short, long)]
+    #[structopt(name = "config", short, long, use_delimiter(true))]
     config_paths: Vec<PathBuf>,
 }
 
@@ -66,9 +66,9 @@ impl InstallOpts {
     fn config_paths_with_formats(&self) -> Vec<(PathBuf, config::FormatHint)> {
         config::merge_path_lists(vec![
             (&self.config_paths, None),
-            (&self.config_paths_toml, Some(config::Format::TOML)),
-            (&self.config_paths_json, Some(config::Format::JSON)),
-            (&self.config_paths_yaml, Some(config::Format::YAML)),
+            (&self.config_paths_toml, Some(config::Format::Toml)),
+            (&self.config_paths_json, Some(config::Format::Json)),
+            (&self.config_paths_yaml, Some(config::Format::Yaml)),
         ])
     }
 }
@@ -215,16 +215,16 @@ fn create_service_arguments(
     config_paths: &[(PathBuf, config::FormatHint)],
 ) -> Option<Vec<OsString>> {
     let config_paths = config::process_paths(&config_paths)?;
-    match config::load_from_paths(&config_paths, false) {
+    match config::load_from_paths(&config_paths) {
         Ok(_) => Some(
             config_paths
                 .iter()
                 .flat_map(|(path, format)| {
                     let key = match format {
                         None => "--config",
-                        Some(config::Format::TOML) => "--config-toml",
-                        Some(config::Format::JSON) => "--config-json",
-                        Some(config::Format::YAML) => "--config-yaml",
+                        Some(config::Format::Toml) => "--config-toml",
+                        Some(config::Format::Json) => "--config-json",
+                        Some(config::Format::Yaml) => "--config-yaml",
                     };
                     vec![OsString::from(key), path.as_os_str().into()]
                 })

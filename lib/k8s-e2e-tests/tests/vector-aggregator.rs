@@ -1,47 +1,51 @@
+use indoc::indoc;
 use k8s_e2e_tests::*;
 use k8s_test_framework::{lock, vector::Config as VectorConfig};
 
 const HELM_CHART_VECTOR_AGGREGATOR: &str = "vector-aggregator";
 
-const HELM_VALUES_DUMMY_TOPOLOGY: &str = r#"
-sources:
-  dummy:
-    type: "generator"
-    rawConfig: |
-      format = "shuffle"
-      lines = ["Hello world"]
-      interval = 60 # once a minute
+const HELM_VALUES_DUMMY_TOPOLOGY: &str = indoc! {r#"
+    sources:
+      dummy:
+        type: "generator"
+        format: "shuffle"
+        lines: ["Hello world"]
+        interval: 60 # once a minute
 
-sinks:
-  stdout:
-    type: "console"
-    inputs: ["dummy"]
-    rawConfig: |
-      target = "stdout"
-      encoding = "json"
-"#;
+    sinks:
+      stdout:
+        type: "console"
+        inputs: ["dummy"]
+        target: "stdout"
+        encoding: "json"
+"#};
 
 /// This test validates that vector-aggregator can deploy with the default
 /// settings and a dummy topology.
 #[tokio::test]
 async fn dummy_topology() -> Result<(), Box<dyn std::error::Error>> {
     let _guard = lock();
+    let namespace = get_namespace();
     let framework = make_framework();
+    let override_name = get_override_name("vector-aggregator");
 
     let vector = framework
         .vector(
-            "test-vector",
+            &namespace,
             HELM_CHART_VECTOR_AGGREGATOR,
             VectorConfig {
-                custom_helm_values: HELM_VALUES_DUMMY_TOPOLOGY,
+                custom_helm_values: &config_override_name(
+                    HELM_VALUES_DUMMY_TOPOLOGY,
+                    &override_name,
+                ),
                 ..Default::default()
             },
         )
         .await?;
     framework
         .wait_for_rollout(
-            "test-vector",
-            "statefulset/vector-aggregator",
+            &namespace,
+            &format!("statefulset/{}", override_name),
             vec!["--timeout=60s"],
         )
         .await?;
@@ -55,25 +59,34 @@ async fn dummy_topology() -> Result<(), Box<dyn std::error::Error>> {
 #[tokio::test]
 async fn metrics_pipeline() -> Result<(), Box<dyn std::error::Error>> {
     let _guard = lock();
+    let namespace = get_namespace();
     let framework = make_framework();
+    let override_name = get_override_name("vector-aggregator");
 
     let vector = framework
         .vector(
-            "test-vector",
+            &namespace,
             HELM_CHART_VECTOR_AGGREGATOR,
-            VectorConfig::default(),
+            VectorConfig {
+                custom_helm_values: &config_override_name("", &override_name),
+                ..Default::default()
+            },
         )
         .await?;
     framework
         .wait_for_rollout(
-            "test-vector",
-            "statefulset/vector-aggregator",
+            &namespace,
+            &format!("statefulset/{}", override_name),
             vec!["--timeout=60s"],
         )
         .await?;
 
-    let mut vector_metrics_port_forward =
-        framework.port_forward("test-vector", "statefulset/vector-aggregator", 9090, 9090)?;
+    let mut vector_metrics_port_forward = framework.port_forward(
+        &namespace,
+        &format!("statefulset/{}", override_name),
+        9090,
+        9090,
+    )?;
     vector_metrics_port_forward.wait_until_ready().await?;
     let vector_metrics_url = format!(
         "http://{}/metrics",
