@@ -4,17 +4,6 @@
 Internal template to render service ports depending on whether service is a headless service or not. Use
 either 'vector-aggregator.servicePorts' or 'vector-aggregator.headlessServicePorts' as entry points.
 */}}
-<<<<<<< HEAD
-{{- define "vector-aggregator.servicePorts" -}}
-{{- if .Values.vectorSource.enabled }}
-- name: vector
-{{- with .Values.vectorSource.nodePort }}
-  nodePort: {{ . }}
-{{- end }}
-  port: {{ .Values.vectorSource.listenPort }}
-  protocol: TCP
-  targetPort: {{ .Values.vectorSource.listenPort }}
-=======
 {{- define "vector-aggregator.internalServicePorts" -}}
 {{- $headless := index . 0 -}}
 {{- $values := index . 1 -}}
@@ -26,7 +15,6 @@ either 'vector-aggregator.servicePorts' or 'vector-aggregator.headlessServicePor
 {{- $_ := set $servicePort "protocol" "TCP" -}}
 {{- $_ := set $servicePort "targetPort" $values.vectorSource.listenPort -}}
 {{ tuple $headless $servicePort | include "libvector.servicePort" }}
->>>>>>> upstream/master
 {{- end }}
 {{- range $values.service.ports }}
 {{ tuple $headless . | include "libvector.servicePort" }}
