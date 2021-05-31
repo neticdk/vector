@@ -4,9 +4,7 @@ kind: PodSecurityPolicy
 metadata:
   name: {{ include "libvector.fullname" . }}
 spec:
-  privileged: false
   allowPrivilegeEscalation: false
-  readOnlyRootFilesystem: false
   requiredDropCapabilities:
     - ALL
   volumes:
@@ -15,6 +13,7 @@ spec:
     - 'secret'
     - 'persistentVolumeClaim'
     - 'emptyDir'
+    - 'projected'
   allowedHostPaths:
     {{- if eq .Values.storage.mode "hostPath" }}
     - pathPrefix: {{ .Values.storage.hostPath | quote }}
@@ -28,7 +27,7 @@ spec:
   hostIPC: false
   hostPID: false
   runAsUser:
-    rule: 'MustRunAsNonRoot'
+    rule: 'RunAsAny'
   seLinux:
     rule: 'RunAsAny'
   supplementalGroups:
